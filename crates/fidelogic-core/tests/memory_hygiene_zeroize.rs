@@ -7,6 +7,7 @@
 //! メモリ上に残留せず確実にゼロクリアされることを検証する。
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -27,8 +28,15 @@ const DEK_SENTINEL: [u8; 32] = *b"FIDELOGIC_MEM_HYGIENE_DEK_BYTES!";
 /// グローバルアロケータ追跡の排他制御ロック。
 static ALLOC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-/// ヒープ解放時検査の有効化フラグ。
-static TRACKING_ACTIVE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// ヒープ解放時検査の有効化フラグ。
+    ///
+    /// アロケータはプロセス全体で共有されるため、フラグもスレッド単位で持つ。
+    /// 検査区間を実行しているスレッドの解放だけを検査対象とし、
+    /// 並列実行中の他テストが行う解放を誤検知しないようにする。
+    /// `const` 初期化かつ `Drop` を持たない型なので、`dealloc` 内で参照しても割り当ては発生しない。
+    static TRACKING_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
 
 /// 検査対象サイズの解放回数カウンタ。
 static CHECKED_DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -106,7 +114,7 @@ unsafe impl GlobalAlloc for MemoryHygieneAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if TRACKING_ACTIVE.load(Ordering::SeqCst) && layout.size() >= 8 {
+        if TRACKING_ACTIVE.get() && layout.size() >= 8 {
             CHECKED_DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
             unsafe { check_freed_memory_for_patterns(ptr, layout.size()) };
         }
@@ -161,9 +169,9 @@ where
     LAST_LEAK_ALLOC_SIZE.store(0, Ordering::SeqCst);
     LAST_LEAK_OFFSET.store(0, Ordering::SeqCst);
 
-    TRACKING_ACTIVE.store(true, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(true);
     let result = f();
-    TRACKING_ACTIVE.store(false, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(false);
 
     let dealloc_count = CHECKED_DEALLOC_COUNT.load(Ordering::SeqCst);
     let leak_mask = LEAK_DETECTED_MASK.load(Ordering::SeqCst);
@@ -244,9 +252,9 @@ where
     CHECKED_DEALLOC_COUNT.store(0, Ordering::SeqCst);
     LEAK_DETECTED_MASK.store(0, Ordering::SeqCst);
 
-    TRACKING_ACTIVE.store(true, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(true);
     f();
-    TRACKING_ACTIVE.store(false, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(false);
 
     let dealloc_count = CHECKED_DEALLOC_COUNT.load(Ordering::SeqCst);
     let leak_mask = LEAK_DETECTED_MASK.load(Ordering::SeqCst);
