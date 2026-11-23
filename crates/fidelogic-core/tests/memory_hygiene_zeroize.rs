@@ -584,9 +584,9 @@ mod vault_memory_hygiene_tests {
     };
     use fidelogic_core::slots::{
         SLOT0_NONCE_LEN, SLOT0_SALT_LEN, SLOT1_NONCE_LEN, SLOT1_SALT_LEN, SLOT2_NONCE_LEN,
-        SLOT2_SALT_LEN, SlotCredential, normalize_recovery_code, unwrap_dek_slot0_with_secret,
-        unwrap_dek_slot1, unwrap_dek_slot2_code, wrap_dek_slot0, wrap_dek_slot0_with_secret,
-        wrap_dek_slot1, wrap_dek_slot2_code,
+        SLOT2_SALT_LEN, SlotCredential, normalize_recovery_code, slot_header_binding,
+        unwrap_dek_slot0_with_secret, unwrap_dek_slot1, unwrap_dek_slot2_code, wrap_dek_slot0,
+        wrap_dek_slot0_with_secret, wrap_dek_slot1, wrap_dek_slot2_code,
     };
     use fidelogic_core::tlv::{EntryPayload, TlvRecord, Vault, VaultHeader};
     use fidelogic_core::{
@@ -1078,18 +1078,27 @@ mod vault_memory_hygiene_tests {
 
         let engine_test_for_suite = |suite: CipherSuiteId, record_nonce: &[u8]| {
             let header = VaultHeader::new(1, suite.as_u8(), 7);
+            // エントリはヘッダー全体、スロットはヘッダー不変部 (epoch_id を含まない) を AAD に結合する。
             let aad = header.associated_data();
+            let slot_aad = slot_header_binding(&header);
 
-            let slot0 = wrap_dek_slot0(&dek, password, &slot0_salt, &slot0_nonce, &params, &aad)
-                .expect("Vault 用 Slot 0 生成に成功。");
-            let slot1 = wrap_dek_slot1(&dek, prf_secret, &slot1_salt, &slot1_nonce, &aad)
+            let slot0 = wrap_dek_slot0(
+                &dek,
+                password,
+                &slot0_salt,
+                &slot0_nonce,
+                &params,
+                &slot_aad,
+            )
+            .expect("Vault 用 Slot 0 生成に成功。");
+            let slot1 = wrap_dek_slot1(&dek, prf_secret, &slot1_salt, &slot1_nonce, &slot_aad)
                 .expect("Vault 用 Slot 1 生成に成功。");
             let slot2 = wrap_dek_slot2_code(
                 &dek,
                 recovery_code_formatted,
                 &slot2_salt,
                 &slot2_nonce,
-                &aad,
+                &slot_aad,
             )
             .expect("Vault 用 Slot 2 生成に成功。");
 
@@ -1371,7 +1380,7 @@ mod vault_memory_hygiene_tests {
                 .expect("ランダム Slot 1 生成に成功。");
 
             let header = VaultHeader::new(1, suite.as_u8(), 1);
-            let slot_aad = header.associated_data();
+            let slot_aad = slot_header_binding(&header);
             let slot1_for_vault = wrap_dek_slot1(&dek_secret, &raw_prf, &salt, &nonce, &slot_aad)
                 .expect("Vault ヘッダーバインド Slot 1 生成に成功。");
             let vault = Vault::new(header, vec![slot1_for_vault], Vec::new());

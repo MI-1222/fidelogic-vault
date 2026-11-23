@@ -623,6 +623,31 @@ pub fn validate_slot0_argon2_params(params: &Argon2Params) -> Result<(), CryptoE
     params.validate()
 }
 
+/// スロットの AAD に結合する Vault ヘッダー不変部のバイト長 (6バイト)。
+pub const SLOT_HEADER_BINDING_LEN: usize = 6;
+
+/// スロットの AEAD 関連データ (AAD) に結合する、Vault ヘッダーの不変部を返す。
+///
+/// フォーマット: `magic(4B) | version(1B) | suite_id(1B)` (計6バイト)。
+/// 保存のたびに進む世代カウンター `epoch_id` は含めない。
+/// これにより `epoch_id` を更新しても、各スロットの秘密による再ラップなしに既存スロットを解錠できる。
+///
+/// スロットの AAD は巻き戻しを検知しない。巻き戻しの検知は
+/// [`VaultHeader::verify_epoch_progression`] と、`epoch_id` を含む [`VaultHeader::associated_data`] を
+/// 結合するエントリ側の AAD が担う。
+#[inline]
+#[must_use]
+pub const fn slot_header_binding(header: &VaultHeader) -> [u8; SLOT_HEADER_BINDING_LEN] {
+    [
+        header.magic[0],
+        header.magic[1],
+        header.magic[2],
+        header.magic[3],
+        header.version,
+        header.suite_id,
+    ]
+}
+
 /// 固定長プレフィックス長と可変長 `vault_aad` の合計長を検証して返す。
 #[inline]
 // 32-bit環境ではMAX_AAD_LENがusize::MAXとなり比較が恒偽になるが、環境非依存の単一コードパス維持のため許可する。
@@ -639,14 +664,14 @@ fn checked_aad_len(fixed_len: usize, vault_aad: &[u8]) -> Result<usize, CryptoEr
 
 /// Slot 0 (Argon2id) のスタック AAD バッファ容量 (64バイト)。
 ///
-/// 固定ヘッダー長 ([`SLOT0_AAD_FIXED_LEN`] = 48B) と通常の Vault ヘッダー AAD
-/// ([`VAULT_HEADER_LEN`] = 14B) の合計 62 バイトをスタック上で完全収容する。
+/// 固定ヘッダー長 ([`SLOT0_AAD_FIXED_LEN`] = 48B) に、ヘッダー不変部 ([`SLOT_HEADER_BINDING_LEN`] = 6B) と
+/// 低レベル API へ渡されうる Vault ヘッダー全体 ([`VAULT_HEADER_LEN`] = 14B) のどちらを加えても、スタック上で完全収容する。
 const SLOT0_AAD_STACK_CAP: usize = 64;
 
 /// Slot 1 / Slot 2 (HKDF-SHA256) のスタック AAD バッファ容量 (68バイト)。
 ///
-/// 固定ヘッダー長 ([`HKDF_SLOT_AAD_FIXED_LEN`] = 52B) と通常の Vault ヘッダー AAD
-/// ([`VAULT_HEADER_LEN`] = 14B) の合計 66 バイトをスタック上で完全収容する。
+/// 固定ヘッダー長 ([`HKDF_SLOT_AAD_FIXED_LEN`] = 52B) に、ヘッダー不変部 ([`SLOT_HEADER_BINDING_LEN`] = 6B) と
+/// 低レベル API へ渡されうる Vault ヘッダー全体 ([`VAULT_HEADER_LEN`] = 14B) のどちらを加えても、スタック上で完全収容する。
 const HKDF_SLOT_AAD_STACK_CAP: usize = 68;
 
 const _: () = assert!(SLOT0_AAD_STACK_CAP >= SLOT0_AAD_FIXED_LEN + VAULT_HEADER_LEN);
@@ -743,7 +768,7 @@ impl<const STACK_CAP: usize> core::ops::Deref for AadBuffer<STACK_CAP> {
 /// Slot 0 の暗号化および復号に用いる AEAD 関連データ (AAD) を構築する。
 ///
 /// ドメイン分離プレフィックス, スロット識別子, KDF 種別, Argon2id パラメータ,
-/// ソルト, 呼び出し元が指定した `vault_aad` (通常は [`VaultHeader::associated_data`]) を結合し、
+/// ソルト, 呼び出し元が指定した `vault_aad` (通常は [`slot_header_binding`]) を結合し、
 /// パラメータのダウングレード攻撃やヘッダーとスロットの間のすり替えを検知する。
 /// 通常時はスタックバッファ ([`Slot0AadBuffer`]) 内でゼロアロケーションにて構築される。
 fn build_slot0_aad(
@@ -767,8 +792,8 @@ fn build_slot0_aad(
 
 /// Slot 0 (Argon2id マスターパスワード) により KEK を導出し、256-bit DEK を暗号化ラップする。
 ///
-/// `vault_aad` には通常 [`VaultHeader::associated_data`] を渡し、
-/// Vault ヘッダーとの暗号学的バインディングを確立する。
+/// `vault_aad` には通常 [`slot_header_binding`] を渡し、
+/// Vault ヘッダーの不変部との暗号学的バインディングを確立する。
 ///
 /// # Errors
 ///
@@ -870,7 +895,7 @@ pub fn wrap_dek_slot0_with_secret(
     payload.to_slot_entry()
 }
 
-/// [`VaultHeader`] を関連データとしてバインドし、Slot 0 により 256-bit DEK を暗号化ラップする。
+/// [`VaultHeader`] の不変部 ([`slot_header_binding`]) を関連データとしてバインドし、Slot 0 により 256-bit DEK を暗号化ラップする。
 ///
 /// # Errors
 ///
@@ -890,7 +915,7 @@ pub fn wrap_dek_slot0_for_header(
         salt,
         nonce,
         params,
-        &header.associated_data(),
+        &slot_header_binding(header),
     )
 }
 
@@ -937,7 +962,7 @@ pub fn unwrap_dek_slot0_with_secret(
     )
 }
 
-/// [`VaultHeader`] を関連データとしてバインドし、Slot 0 の暗号化エントリから 256-bit DEK を復号する。
+/// [`VaultHeader`] の不変部 ([`slot_header_binding`]) を関連データとしてバインドし、Slot 0 の暗号化エントリから 256-bit DEK を復号する。
 ///
 /// # Errors
 ///
@@ -948,7 +973,7 @@ pub fn unwrap_dek_slot0_for_header(
     password: &[u8],
     header: &VaultHeader,
 ) -> Result<SecretBytes<DEK_LEN>, VaultError> {
-    unwrap_dek_slot0(entry, password, &header.associated_data())
+    unwrap_dek_slot0(entry, password, &slot_header_binding(header))
 }
 
 /// スロットエントリのフォーマットおよびパラメータが、Slot 0 (Argon2id) として有効かを判定する。
@@ -1027,7 +1052,7 @@ fn unwrap_dek_hkdf_slot(
 /// Slot 1 (WebAuthn PRF / HKDF-SHA256) により KEK を導出し、256-bit DEK を暗号化ラップする。
 ///
 /// `prf_secret` には WebAuthn PRF 拡張から取得した 32バイト以上の高エントロピー出力を指定する。
-/// `vault_aad` には通常 [`VaultHeader::associated_data`] を渡し、Vault ヘッダーと暗号学的に結合する。
+/// `vault_aad` には通常 [`slot_header_binding`] を渡し、Vault ヘッダーの不変部と暗号学的に結合する。
 ///
 /// # Errors
 ///
@@ -1044,7 +1069,7 @@ pub fn wrap_dek_slot1(
     wrap_dek_hkdf_slot(&SLOT1_SPEC, dek, prf_secret, salt, nonce, vault_aad)
 }
 
-/// [`VaultHeader`] を関連データとしてバインドし、Slot 1 により 256-bit DEK を暗号化ラップする。
+/// [`VaultHeader`] の不変部 ([`slot_header_binding`]) を関連データとしてバインドし、Slot 1 により 256-bit DEK を暗号化ラップする。
 ///
 /// # Errors
 ///
@@ -1057,7 +1082,7 @@ pub fn wrap_dek_slot1_for_header(
     nonce: &[u8; SLOT1_NONCE_LEN],
     header: &VaultHeader,
 ) -> Result<KekSlotEntry, VaultError> {
-    wrap_dek_slot1(dek, prf_secret, salt, nonce, &header.associated_data())
+    wrap_dek_slot1(dek, prf_secret, salt, nonce, &slot_header_binding(header))
 }
 
 /// Slot 1 の暗号化エントリから HKDF-SHA256 により KEK を再導出し、256-bit DEK を復号する。
@@ -1076,7 +1101,7 @@ pub fn unwrap_dek_slot1(
     unwrap_dek_hkdf_slot(&SLOT1_SPEC, entry, prf_secret, vault_aad)
 }
 
-/// [`VaultHeader`] を関連データとしてバインドし、Slot 1 の暗号化エントリから 256-bit DEK を復号する。
+/// [`VaultHeader`] の不変部 ([`slot_header_binding`]) を関連データとしてバインドし、Slot 1 の暗号化エントリから 256-bit DEK を復号する。
 ///
 /// # Errors
 ///
@@ -1087,7 +1112,7 @@ pub fn unwrap_dek_slot1_for_header(
     prf_secret: &[u8],
     header: &VaultHeader,
 ) -> Result<SecretBytes<DEK_LEN>, VaultError> {
-    unwrap_dek_slot1(entry, prf_secret, &header.associated_data())
+    unwrap_dek_slot1(entry, prf_secret, &slot_header_binding(header))
 }
 
 /// スロットエントリのフォーマットが Slot 1 (WebAuthn PRF / HKDF-SHA256) として有効かを判定する。
@@ -1153,7 +1178,7 @@ pub fn wrap_dek_slot2(
     wrap_dek_hkdf_slot(&SLOT2_SPEC, dek, recovery_secret, salt, nonce, vault_aad)
 }
 
-/// [`VaultHeader`] を関連データとしてバインドし、Slot 2 により 256-bit DEK を暗号化ラップする。
+/// [`VaultHeader`] の不変部 ([`slot_header_binding`]) を関連データとしてバインドし、Slot 2 により 256-bit DEK を暗号化ラップする。
 ///
 /// # Errors
 ///
@@ -1166,7 +1191,13 @@ pub fn wrap_dek_slot2_for_header(
     nonce: &[u8; SLOT2_NONCE_LEN],
     header: &VaultHeader,
 ) -> Result<KekSlotEntry, VaultError> {
-    wrap_dek_slot2(dek, recovery_secret, salt, nonce, &header.associated_data())
+    wrap_dek_slot2(
+        dek,
+        recovery_secret,
+        salt,
+        nonce,
+        &slot_header_binding(header),
+    )
 }
 
 /// 整形済み英数字リカバリーコードを正準化した上で、Slot 2 により 256-bit DEK を暗号化ラップする。
@@ -1189,7 +1220,7 @@ pub fn wrap_dek_slot2_code(
     res
 }
 
-/// [`VaultHeader`] を関連データとしてバインドし、整形済みリカバリーコードで Slot 2 を暗号化ラップする。
+/// [`VaultHeader`] の不変部 ([`slot_header_binding`]) を関連データとしてバインドし、整形済みリカバリーコードで Slot 2 を暗号化ラップする。
 ///
 /// # Errors
 ///
@@ -1202,7 +1233,13 @@ pub fn wrap_dek_slot2_code_for_header(
     nonce: &[u8; SLOT2_NONCE_LEN],
     header: &VaultHeader,
 ) -> Result<KekSlotEntry, VaultError> {
-    wrap_dek_slot2_code(dek, recovery_code, salt, nonce, &header.associated_data())
+    wrap_dek_slot2_code(
+        dek,
+        recovery_code,
+        salt,
+        nonce,
+        &slot_header_binding(header),
+    )
 }
 
 /// Slot 2 の暗号化エントリから生リカバリーシークレットを用いて 256-bit DEK を復号する。
@@ -1221,7 +1258,7 @@ pub fn unwrap_dek_slot2(
     unwrap_dek_hkdf_slot(&SLOT2_SPEC, entry, recovery_secret, vault_aad)
 }
 
-/// [`VaultHeader`] を関連データとしてバインドし、Slot 2 の暗号化エントリから 256-bit DEK を復号する。
+/// [`VaultHeader`] の不変部 ([`slot_header_binding`]) を関連データとしてバインドし、Slot 2 の暗号化エントリから 256-bit DEK を復号する。
 ///
 /// # Errors
 ///
@@ -1232,7 +1269,7 @@ pub fn unwrap_dek_slot2_for_header(
     recovery_secret: &[u8],
     header: &VaultHeader,
 ) -> Result<SecretBytes<DEK_LEN>, VaultError> {
-    unwrap_dek_slot2(entry, recovery_secret, &header.associated_data())
+    unwrap_dek_slot2(entry, recovery_secret, &slot_header_binding(header))
 }
 
 /// 整形済み英数字リカバリーコードを正準化した上で、Slot 2 の暗号化エントリから 256-bit DEK を復号する。
@@ -1251,7 +1288,7 @@ pub fn unwrap_dek_slot2_code(
     res
 }
 
-/// [`VaultHeader`] を関連データとしてバインドし、整形済みリカバリーコードで Slot 2 を復号する。
+/// [`VaultHeader`] の不変部 ([`slot_header_binding`]) を関連データとしてバインドし、整形済みリカバリーコードで Slot 2 を復号する。
 ///
 /// # Errors
 ///
@@ -1262,7 +1299,7 @@ pub fn unwrap_dek_slot2_code_for_header(
     recovery_code: &[u8],
     header: &VaultHeader,
 ) -> Result<SecretBytes<DEK_LEN>, VaultError> {
-    unwrap_dek_slot2_code(entry, recovery_code, &header.associated_data())
+    unwrap_dek_slot2_code(entry, recovery_code, &slot_header_binding(header))
 }
 
 /// スロットエントリのフォーマットが Slot 2 (リカバリーコード) として有効かを判定する。
@@ -2049,7 +2086,7 @@ impl VaultEngine {
         )
     }
 
-    /// [`Vault`] コンテナ全体から Slot 0 を検索し、Vault ヘッダー AAD をバインドして解錠する。
+    /// [`Vault`] コンテナ全体から Slot 0 を検索し、Vault ヘッダーの不変部 ([`slot_header_binding`]) を AAD にバインドして解錠する。
     ///
     /// # Errors
     ///
@@ -2064,7 +2101,7 @@ impl VaultEngine {
         self.unlock_vault_with_credential(vault, SlotCredential::password(password))
     }
 
-    /// [`Vault`] コンテナ全体から Slot 1 (WebAuthn PRF) を検索し、Vault ヘッダー AAD をバインドして解錠する。
+    /// [`Vault`] コンテナ全体から Slot 1 (WebAuthn PRF) を検索し、Vault ヘッダーの不変部 ([`slot_header_binding`]) を AAD にバインドして解錠する。
     ///
     /// # Errors
     ///
@@ -2080,7 +2117,7 @@ impl VaultEngine {
     }
 
     /// [`Vault`] コンテナ全体から Slot 2 (生リカバリーシークレット) を検索し、
-    /// Vault ヘッダー AAD をバインドして解錠する。
+    /// Vault ヘッダーの不変部 ([`slot_header_binding`]) を AAD にバインドして解錠する。
     ///
     /// # Errors
     ///
@@ -2096,7 +2133,7 @@ impl VaultEngine {
     }
 
     /// [`Vault`] コンテナ全体から Slot 2 (整形済みリカバリーコード) を検索し、
-    /// Vault ヘッダー AAD をバインドして解錠する。
+    /// Vault ヘッダーの不変部 ([`slot_header_binding`]) を AAD にバインドして解錠する。
     ///
     /// # Errors
     ///
@@ -2212,7 +2249,7 @@ impl VaultEngine {
         self.start_unlock(kind)
             .map_err(VaultError::mask_auth_error)?;
 
-        let header_aad = vault.header.associated_data();
+        let header_aad = slot_header_binding(&vault.header);
         match self.eval_vault_credential_traced(vault, credential, &header_aad, trace) {
             Ok(mut dek) => {
                 if let Err(err) = self.complete_unlock(kind, &mut dek) {
@@ -2250,7 +2287,7 @@ impl VaultEngine {
             return (Err(err.mask_auth_error()), trace);
         }
 
-        let header_aad = vault.header.associated_data();
+        let header_aad = slot_header_binding(&vault.header);
         let mut matched_kind: Option<SlotKind> = None;
         let mut matched_dek = SecretBytes::<DEK_LEN>::zero();
         let mut seen_kinds = [false; SlotKind::COUNT];
@@ -2468,6 +2505,216 @@ mod tests {
         }
     }
 
+    /// ヘッダー不変部 (magic, version, suite_id) を1項目ずつ改ざんしたヘッダー群を返す。
+    fn tampered_invariant_headers(header: VaultHeader) -> [VaultHeader; 3] {
+        let mut wrong_magic = header;
+        wrong_magic.magic[0] ^= 0x01;
+        let mut wrong_version = header;
+        wrong_version.version ^= 0x01;
+        let mut wrong_suite = header;
+        wrong_suite.suite_id ^= 0x01;
+        [wrong_magic, wrong_version, wrong_suite]
+    }
+
+    #[test]
+    fn test_slot_header_binding_layout_excludes_epoch_id() {
+        let header = test_header();
+        let binding = slot_header_binding(&header);
+        assert_eq!(binding.len(), SLOT_HEADER_BINDING_LEN);
+        // ヘッダー直列化の先頭6バイト (magic, version, suite_id) と一致する。
+        assert_eq!(
+            &binding[..],
+            &header.associated_data()[..SLOT_HEADER_BINDING_LEN]
+        );
+
+        // epoch_id のみ異なるヘッダーは同一の結合値となる。
+        let next_epoch = VaultHeader {
+            epoch_id: u64::MAX,
+            ..header
+        };
+        assert_eq!(slot_header_binding(&next_epoch), binding);
+
+        // 不変部のいずれかが異なれば結合値も異なる。
+        for tampered_header in tampered_invariant_headers(header) {
+            assert_ne!(slot_header_binding(&tampered_header), binding);
+        }
+    }
+
+    #[test]
+    fn slot2_for_header_ignores_epoch_and_detects_invariant_tamper() {
+        let dek = test_dek();
+        let header = test_header();
+        let recovery = test_recovery_secret();
+        let recovery_code = TEST_RECOVERY_CODE;
+        let raw_entry =
+            wrap_dek_slot2_for_header(&dek, &recovery, &test_salt32(), &test_nonce(), &header)
+                .unwrap();
+        let code_entry =
+            wrap_dek_slot2_code_for_header(&dek, recovery_code, &[0x23; 32], &[0x33; 24], &header)
+                .unwrap();
+
+        // スロットの AAD は epoch_id を含まないため、世代が前後しても解錠できる。
+        for epoch_id in [0, 41, 43, u64::MAX] {
+            let other_epoch = VaultHeader { epoch_id, ..header };
+            assert_eq!(
+                unwrap_dek_slot2_for_header(&raw_entry, &recovery, &other_epoch)
+                    .unwrap()
+                    .as_bytes(),
+                dek.as_bytes()
+            );
+            assert_eq!(
+                unwrap_dek_slot2_code_for_header(&code_entry, recovery_code, &other_epoch)
+                    .unwrap()
+                    .as_bytes(),
+                dek.as_bytes()
+            );
+        }
+
+        // ヘッダー不変部 (magic, version, suite_id) の改ざん検知。
+        for tampered_header in tampered_invariant_headers(header) {
+            assert_eq!(
+                unwrap_dek_slot2_for_header(&raw_entry, &recovery, &tampered_header).err(),
+                Some(VaultError::Crypto(CryptoError::AeadDecryptionFailed))
+            );
+            assert_eq!(
+                unwrap_dek_slot2_code_for_header(&code_entry, recovery_code, &tampered_header)
+                    .err(),
+                Some(VaultError::Crypto(CryptoError::AeadDecryptionFailed))
+            );
+        }
+    }
+
+    #[test]
+    fn test_epoch_advance_keeps_all_slots_unlockable_without_rewrap() {
+        let dek = test_dek();
+        let header = test_header();
+        let password = b"master-password";
+        let prf = test_prf_secret();
+        let recovery_code = TEST_RECOVERY_CODE;
+
+        let slot0 = wrap_dek_slot0_for_header(
+            &dek,
+            password,
+            &test_salt(),
+            &test_nonce(),
+            &test_params(),
+            &header,
+        )
+        .unwrap();
+        let slot1 =
+            wrap_dek_slot1_for_header(&dek, &prf, &[0x21; 32], &[0x31; 24], &header).unwrap();
+        let slot2 =
+            wrap_dek_slot2_code_for_header(&dek, recovery_code, &[0x22; 32], &[0x32; 24], &header)
+                .unwrap();
+        let slots = vec![slot0, slot1, slot2];
+
+        // 保存を繰り返して epoch_id を進めた Vault を、再ラップせずに各スロットで解錠する。
+        let mut advanced = header;
+        for _ in 0..3 {
+            advanced = advanced.checked_increment_epoch().unwrap();
+        }
+        assert!(advanced.is_newer_than(&header));
+        let vault = Vault::new(advanced, slots.clone(), vec![]);
+
+        // 世代の境界値 (0, u64::MAX) でも、先行スロットの失敗を経て後続スロットで解錠できる。
+        for epoch_id in [0, u64::MAX] {
+            let boundary_vault =
+                Vault::new(VaultHeader { epoch_id, ..header }, slots.clone(), vec![]);
+            let mut boundary_engine = VaultEngine::from_slot_entries(&boundary_vault.slots);
+            assert_eq!(
+                boundary_engine.unlock_vault_with_any(
+                    &boundary_vault,
+                    &[
+                        SlotCredential::password(b"wrong-password"),
+                        SlotCredential::prf(&prf),
+                    ],
+                ),
+                Ok(SlotKind::Prf)
+            );
+            assert_eq!(boundary_engine.dek().unwrap().as_bytes(), dek.as_bytes());
+        }
+
+        let mut engine = VaultEngine::from_slot_entries(&vault.slots);
+        assert_eq!(engine.unlock_vault_with_password(&vault, password), Ok(()));
+        assert_eq!(engine.dek().unwrap().as_bytes(), dek.as_bytes());
+        engine.lock().unwrap();
+        assert_eq!(engine.unlock_vault_with_prf(&vault, &prf), Ok(()));
+        assert_eq!(engine.dek().unwrap().as_bytes(), dek.as_bytes());
+        engine.lock().unwrap();
+        assert_eq!(
+            engine.unlock_vault_with_recovery_code(&vault, recovery_code),
+            Ok(())
+        );
+        assert_eq!(engine.dek().unwrap().as_bytes(), dek.as_bytes());
+        engine.lock().unwrap();
+
+        // 生リカバリーシークレットで包んだ Slot 2 も、世代更新後に再ラップなしで解錠できる。
+        let recovery = test_recovery_secret();
+        let raw_slot2 =
+            wrap_dek_slot2_for_header(&dek, &recovery, &[0x24; 32], &[0x34; 24], &header).unwrap();
+        let raw_vault = Vault::new(advanced, vec![raw_slot2], vec![]);
+        let mut raw_engine = VaultEngine::from_slot_entries(&raw_vault.slots);
+        assert_eq!(
+            raw_engine.unlock_vault_with_recovery(&raw_vault, &recovery),
+            Ok(())
+        );
+        assert_eq!(raw_engine.dek().unwrap().as_bytes(), dek.as_bytes());
+
+        // ペッパー併用の Slot 0 も、世代更新後に再ラップなしで解錠できる。
+        let pepper = b"app-pepper";
+        let pepper_slot0 = wrap_dek_slot0_with_secret(
+            &dek,
+            password,
+            &test_salt(),
+            &test_nonce(),
+            &test_params(),
+            pepper,
+            &slot_header_binding(&header),
+        )
+        .unwrap();
+        let pepper_vault = Vault::new(advanced, vec![pepper_slot0], vec![]);
+        let mut pepper_engine = VaultEngine::from_slot_entries(&pepper_vault.slots);
+        assert_eq!(
+            pepper_engine.unlock_vault_with_credential(
+                &pepper_vault,
+                SlotCredential::password_with_secret(password, pepper)
+            ),
+            Ok(())
+        );
+        assert_eq!(pepper_engine.dek().unwrap().as_bytes(), dek.as_bytes());
+
+        let creds = [
+            SlotCredential::password(password),
+            SlotCredential::prf(&prf),
+            SlotCredential::recovery_code(recovery_code),
+        ];
+        assert_eq!(
+            engine.unlock_vault_with_any(&vault, &creds),
+            Ok(SlotKind::Argon2id)
+        );
+        engine.lock().unwrap();
+        assert!(engine.unlock_vault_with_all_slots(&vault, &creds).is_ok());
+        assert_eq!(engine.dek().unwrap().as_bytes(), dek.as_bytes());
+        engine.lock().unwrap();
+
+        // 巻き戻しの検知はスロットではなく世代カウンターの検証が担う。
+        assert_eq!(
+            header.verify_epoch_progression(advanced.epoch_id),
+            Err(VaultError::RollbackDetected)
+        );
+
+        // ヘッダー不変部を改ざんした Vault はいずれのスロットでも解錠できない。
+        for tampered_header in tampered_invariant_headers(advanced) {
+            let tampered_vault = Vault::new(tampered_header, slots.clone(), vec![]);
+            let mut tampered_engine = VaultEngine::from_slot_entries(&tampered_vault.slots);
+            assert_eq!(
+                tampered_engine.unlock_vault_with_any(&tampered_vault, &creds),
+                Err(VaultError::AuthenticationFailed)
+            );
+            assert_eq!(tampered_engine.state(), VaultState::Locked);
+        }
+    }
+
     #[test]
     fn test_kdf_kind_conversions() {
         assert_eq!(KdfKind::from_u8(KDF_KIND_ARGON2ID), Ok(KdfKind::Argon2id));
@@ -2517,7 +2764,7 @@ mod tests {
         let salt = test_salt();
         let nonce = test_nonce();
         let params = test_params();
-        let aad = test_header().associated_data();
+        let aad = slot_header_binding(&test_header());
 
         let entry =
             wrap_dek_slot0_with_secret(&dek, password, &salt, &nonce, &params, pepper, &aad)
@@ -2545,7 +2792,7 @@ mod tests {
         let nonce = test_nonce();
         let params = test_params();
         let header = test_header();
-        let aad = header.associated_data();
+        let aad = slot_header_binding(&header);
 
         let entry = wrap_dek_slot0(&dek, password, &salt, &nonce, &params, &aad).unwrap();
 
@@ -2556,16 +2803,25 @@ mod tests {
             "誤パスワードに対するAEAD復号失敗の確認に成功。"
         );
 
-        // VaultHeader (epoch_id 巻き戻し) の改ざん検知。
-        let rolled_back = VaultHeader {
-            epoch_id: 41,
-            ..header
-        };
-        assert_eq!(
-            unwrap_dek_slot0_for_header(&entry, password, &rolled_back).err(),
-            Some(VaultError::Crypto(CryptoError::AeadDecryptionFailed)),
-            "epoch_id 巻き戻し時のAAD不一致検知に成功。"
-        );
+        // スロットの AAD は epoch_id を含まないため、世代が前後しても解錠できる。
+        for epoch_id in [0, 41, 43, u64::MAX] {
+            let other_epoch = VaultHeader { epoch_id, ..header };
+            let unwrapped = unwrap_dek_slot0_for_header(&entry, password, &other_epoch).unwrap();
+            assert_eq!(
+                unwrapped.as_bytes(),
+                dek.as_bytes(),
+                "epoch_id {epoch_id} のヘッダーでの解錠に成功。"
+            );
+        }
+
+        // ヘッダー不変部 (magic, version, suite_id) の改ざん検知。
+        for tampered_header in tampered_invariant_headers(header) {
+            assert_eq!(
+                unwrap_dek_slot0_for_header(&entry, password, &tampered_header).err(),
+                Some(VaultError::Crypto(CryptoError::AeadDecryptionFailed)),
+                "ヘッダー不変部の改ざん時のAAD不一致検知に成功。"
+            );
+        }
 
         // wrapped_dek 内 (salt, nonce, ciphertext, auth_tag) の全バイト位置に対する改ざん検知。
         // 先頭 12 バイトは Argon2id パラメータのため、パラメータ制約に違反するか AEAD タグ不一致となる。
@@ -2586,7 +2842,7 @@ mod tests {
         let salt = test_salt();
         let nonce = test_nonce();
         let params = test_params();
-        let aad = test_header().associated_data();
+        let aad = slot_header_binding(&test_header());
 
         let entry = wrap_dek_slot0(&dek, password, &salt, &nonce, &params, &aad).unwrap();
 
@@ -2659,7 +2915,7 @@ mod tests {
         let nonce1 = test_nonce();
         let params = test_params();
         let header = test_header();
-        let aad = header.associated_data();
+        let aad = slot_header_binding(&header);
 
         let slot0_v1 = wrap_dek_slot0(&dek, password_v1, &salt1, &nonce1, &params, &aad).unwrap();
         let vault = Vault::new(
@@ -2946,13 +3202,24 @@ mod tests {
             Some(VaultError::Crypto(CryptoError::AeadDecryptionFailed))
         );
 
-        // AAD バインドによる epoch_id 変更 (ロールバック攻撃相当) の検知を確認。
-        let mut rolled_back = header;
-        rolled_back.epoch_id += 1;
-        assert_eq!(
-            unwrap_dek_slot1_for_header(&entry, &prf, &rolled_back).err(),
-            Some(VaultError::Crypto(CryptoError::AeadDecryptionFailed))
-        );
+        // スロットの AAD は epoch_id を含まないため、世代が前後しても解錠できる。
+        for epoch_id in [0, 41, 43, u64::MAX] {
+            let other_epoch = VaultHeader { epoch_id, ..header };
+            assert_eq!(
+                unwrap_dek_slot1_for_header(&entry, &prf, &other_epoch)
+                    .unwrap()
+                    .as_bytes(),
+                dek.as_bytes()
+            );
+        }
+
+        // ヘッダー不変部 (magic, version, suite_id) の改ざん検知。
+        for tampered_header in tampered_invariant_headers(header) {
+            assert_eq!(
+                unwrap_dek_slot1_for_header(&entry, &prf, &tampered_header).err(),
+                Some(VaultError::Crypto(CryptoError::AeadDecryptionFailed))
+            );
+        }
 
         // wrapped_dek 全104バイトにおける任意の 1ビット改ざん検知を確認。
         for pos in 0..SLOT1_WRAPPED_DEK_LEN {
@@ -3144,7 +3411,7 @@ mod tests {
     fn slot_multiplexing_soundness_any_single_valid_slot_unlocks() {
         let dek = test_dek();
         let header = test_header();
-        let header_aad = header.associated_data();
+        let header_aad = slot_header_binding(&header);
         let password = b"master-password";
         let prf = test_prf_secret();
         let recovery_code = TEST_RECOVERY_CODE;
@@ -3383,7 +3650,7 @@ mod tests {
     fn test_missing_corrupted_duplicate_and_invalid_inputs_run_dummy_ops() {
         let dek = test_dek();
         let header = test_header();
-        let header_aad = header.associated_data();
+        let header_aad = slot_header_binding(&header);
         let prf = test_prf_secret();
 
         // 空の Vault に対する各スロット解錠ではダミー暗号演算を実行し、
@@ -3530,7 +3797,7 @@ mod tests {
     fn test_external_unlock_apis_uniformly_mask_internal_errors() {
         let dek = test_dek();
         let header = test_header();
-        let header_aad = header.associated_data();
+        let header_aad = slot_header_binding(&header);
         let password = b"correct-password";
         let pepper = b"app-pepper";
         let prf = test_prf_secret();
@@ -3676,18 +3943,22 @@ mod tests {
             vec![bad_len_slot0, bad_len_slot1, bad_len_slot2],
             vec![],
         );
-        let rollback_header = VaultHeader {
-            epoch_id: header.epoch_id - 1,
+        // epoch_id はスロットの AAD に含まれないため、ヘッダー不変部 (version) を改ざんして AAD 不一致を作る。
+        let tampered_header = VaultHeader {
+            version: header.version ^ 0x01,
             ..header
         };
-        let rollback_vault = Vault::new(rollback_header, vec![slot0, slot1, slot2_code], vec![]);
+        // Slot 2 の重複による拒絶を避けるため、生シークレット版と整形済みコード版で Vault を分ける。
+        let raw_slots = vec![slot0.clone(), slot1.clone(), slot2_raw.clone()];
+        let code_slots = vec![slot0, slot1, slot2_code];
+        let tampered_vault = Vault::new(tampered_header, raw_slots.clone(), vec![]);
 
         for target_vault in [
             &empty_vault,
             &dup_vault,
             &corrupt_vault,
             &valid_vault,
-            &rollback_vault,
+            &tampered_vault,
         ] {
             let mut v_engine = VaultEngine::from_slot_entries(&target_vault.slots)
                 .with_dummy_argon2_params(test_params());
@@ -3724,6 +3995,52 @@ mod tests {
                 assert_eq!(v_engine.state(), VaultState::Locked);
                 assert!(v_engine.is_safe_state());
                 assert!(v_engine.observe_dek().is_none());
+            }
+        }
+
+        // 正しい資格情報でも、ヘッダー不変部の AAD 不一致は同一の AuthenticationFailed に収束する。
+        // 改ざん前のヘッダーでは同じ資格情報で解錠できることを併せて確認し、失敗の原因を AAD 不一致に限定する。
+        let password_cred = SlotCredential::password_with_secret(password, pepper);
+        let run_correct_unlocks = |vault: &Vault, recovery_cred: SlotCredential<'_>| {
+            let creds = [password_cred, SlotCredential::prf(&prf), recovery_cred];
+            let fresh_engine = || {
+                VaultEngine::from_slot_entries(&vault.slots).with_dummy_argon2_params(test_params())
+            };
+            let mut results = alloc::vec::Vec::new();
+            let mut e = fresh_engine();
+            results.push((e.unlock_vault_with_credential(vault, password_cred), e));
+            let mut e = fresh_engine();
+            results.push((e.unlock_vault_with_prf(vault, &prf), e));
+            let mut e = fresh_engine();
+            let recovery_res = if matches!(recovery_cred, SlotCredential::RecoveryCode(_)) {
+                e.unlock_vault_with_recovery_code(vault, recovery_code)
+            } else {
+                e.unlock_vault_with_recovery(vault, &recovery)
+            };
+            results.push((recovery_res, e));
+            let mut e = fresh_engine();
+            results.push((e.unlock_vault_with_any(vault, &creds).map(|_| ()), e));
+            let mut e = fresh_engine();
+            results.push((e.unlock_vault_with_all_slots(vault, &creds).map(|_| ()), e));
+            results
+        };
+        for (slots, recovery_cred) in [
+            (&raw_slots, SlotCredential::recovery(&recovery)),
+            (&code_slots, SlotCredential::recovery_code(recovery_code)),
+        ] {
+            let intact_vault = Vault::new(header, slots.clone(), vec![]);
+            for (res, e) in run_correct_unlocks(&intact_vault, recovery_cred) {
+                assert_eq!(res, Ok(()));
+                assert_eq!(e.dek().unwrap().as_bytes(), dek.as_bytes());
+            }
+            for tampered_header in tampered_invariant_headers(header) {
+                let tampered = Vault::new(tampered_header, slots.clone(), vec![]);
+                for (res, e) in run_correct_unlocks(&tampered, recovery_cred) {
+                    assert_eq!(res, Err(VaultError::AuthenticationFailed));
+                    assert_eq!(e.state(), VaultState::Locked);
+                    assert!(e.is_safe_state());
+                    assert!(e.observe_dek().is_none());
+                }
             }
         }
 
@@ -3922,7 +4239,7 @@ mod tests {
     fn test_unlock_with_entry_all_credentials_and_error_handling() {
         let dek = test_dek();
         let header = test_header();
-        let header_aad = header.associated_data();
+        let header_aad = slot_header_binding(&header);
         let params = test_params();
         let salt = test_salt();
         let salt32 = test_salt32();
@@ -4128,7 +4445,7 @@ mod tests {
             &[1u8; SLOT0_SALT_LEN],
             &[2u8; SLOT0_NONCE_LEN],
             &custom_params,
-            &header.associated_data(),
+            &slot_header_binding(&header),
         )
         .expect("Slot 0 ラップに成功。");
 
@@ -4145,7 +4462,7 @@ mod tests {
             &[3u8; 32],
             &[4u8; SLOT1_SALT_LEN],
             &[5u8; SLOT1_NONCE_LEN],
-            &header.associated_data(),
+            &slot_header_binding(&header),
         )
         .expect("Slot 1 ラップに成功。");
         let engine_without_slot0 =
@@ -4167,7 +4484,7 @@ mod tests {
             &[1u8; SLOT0_SALT_LEN],
             &[2u8; SLOT0_NONCE_LEN],
             &custom_params,
-            &header.associated_data(),
+            &slot_header_binding(&header),
         )
         .expect("Slot 0 ラップに成功。");
         let vault = Vault::new(header, vec![entry], vec![]);
@@ -4175,7 +4492,7 @@ mod tests {
         // 1. スロット無効化状態のエンジンでも、Vault内のカスタムパラメータでダミー演算が実行される。
         let invalid_engine = VaultEngine::locked();
         let mut trace = SlotEvalTrace::default();
-        let header_aad = vault.header.associated_data();
+        let header_aad = slot_header_binding(&vault.header);
         let res = invalid_engine.eval_vault_credential_traced(
             &vault,
             SlotCredential::password(b"wrong_password"),
@@ -4476,17 +4793,26 @@ mod tests {
         let params = test_params();
         let salt = test_salt();
         let header = test_header();
-        let header_aad = header.associated_data();
+        let header_aad = slot_header_binding(&header);
 
-        // 通常の VaultHeader AAD (14B) バインド時はスタック完結 (ゼロアロケーション)。
+        // ヘッダー不変部 (6B) バインド時はスタック完結 (ゼロアロケーション)。
         let aad_normal = build_slot0_aad(&params, &salt, &header_aad).unwrap();
         assert!(aad_normal.is_stack());
-        assert_eq!(aad_normal.len(), SLOT0_AAD_FIXED_LEN + VAULT_HEADER_LEN);
-        assert_eq!(aad_normal.len(), 62);
+        assert_eq!(
+            aad_normal.len(),
+            SLOT0_AAD_FIXED_LEN + SLOT_HEADER_BINDING_LEN
+        );
+        assert_eq!(aad_normal.len(), 54);
         assert!(aad_normal.starts_with(SLOT0_AAD_PREFIX));
         assert_eq!(aad_normal[18], SLOT_ID_ARGON2ID);
         assert_eq!(aad_normal[19], KDF_KIND_ARGON2ID);
-        assert_eq!(&aad_normal[62 - VAULT_HEADER_LEN..], &header_aad);
+        assert_eq!(&aad_normal[54 - SLOT_HEADER_BINDING_LEN..], &header_aad);
+
+        // 低レベル API へ Vault ヘッダー全体 (14B) を渡した場合もスタック完結。
+        let full_header_aad = header.associated_data();
+        let aad_full = build_slot0_aad(&params, &salt, &full_header_aad).unwrap();
+        assert!(aad_full.is_stack());
+        assert_eq!(aad_full.len(), SLOT0_AAD_FIXED_LEN + VAULT_HEADER_LEN);
 
         // 空 AAD 時もスタック完結。
         let aad_empty = build_slot0_aad(&params, &salt, &[]).unwrap();
@@ -4506,17 +4832,26 @@ mod tests {
         let spec = SLOT1_SPEC;
         let salt = [0x42u8; SLOT1_SALT_LEN];
         let header = test_header();
-        let header_aad = header.associated_data();
+        let header_aad = slot_header_binding(&header);
 
-        // 通常の VaultHeader AAD (14B) バインド時はスタック完結 (ゼロアロケーション)。
+        // ヘッダー不変部 (6B) バインド時はスタック完結 (ゼロアロケーション)。
         let aad_normal = build_hkdf_slot_aad(&spec, &salt, &header_aad).unwrap();
         assert!(aad_normal.is_stack());
-        assert_eq!(aad_normal.len(), HKDF_SLOT_AAD_FIXED_LEN + VAULT_HEADER_LEN);
-        assert_eq!(aad_normal.len(), 66);
+        assert_eq!(
+            aad_normal.len(),
+            HKDF_SLOT_AAD_FIXED_LEN + SLOT_HEADER_BINDING_LEN
+        );
+        assert_eq!(aad_normal.len(), 58);
         assert!(aad_normal.starts_with(spec.aad_prefix));
         assert_eq!(aad_normal[18], spec.slot_id);
         assert_eq!(aad_normal[19], spec.kdf_kind);
-        assert_eq!(&aad_normal[66 - VAULT_HEADER_LEN..], &header_aad);
+        assert_eq!(&aad_normal[58 - SLOT_HEADER_BINDING_LEN..], &header_aad);
+
+        // 低レベル API へ Vault ヘッダー全体 (14B) を渡した場合もスタック完結。
+        let full_header_aad = header.associated_data();
+        let aad_full = build_hkdf_slot_aad(&spec, &salt, &full_header_aad).unwrap();
+        assert!(aad_full.is_stack());
+        assert_eq!(aad_full.len(), HKDF_SLOT_AAD_FIXED_LEN + VAULT_HEADER_LEN);
 
         // 空 AAD 時もスタック完結。
         let aad_empty = build_hkdf_slot_aad(&spec, &salt, &[]).unwrap();
