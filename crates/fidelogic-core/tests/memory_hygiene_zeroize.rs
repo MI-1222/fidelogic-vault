@@ -1484,3 +1484,64 @@ mod vault_memory_hygiene_tests {
         }
     }
 }
+
+#[cfg(feature = "alloc")]
+#[test]
+fn test_entry_seal_open_memory_hygiene_success_and_error() {
+    use fidelogic_core::cipher::{CipherSuiteId, VaultCipher};
+    use fidelogic_core::entry::{EntrySource, open_entries, seal_entries};
+    use fidelogic_core::error::VaultError;
+    use fidelogic_core::tlv::{TlvRecord, VaultHeader};
+
+    // 2 チャンクにまたがるように、センチネルを 7 回繰り返した 224 バイトを平文とする (1 チャンクの容量は 193 バイト)。
+    let mut plaintext = Vec::new();
+    for _ in 0..7 {
+        plaintext.extend_from_slice(&PLAINTEXT_SENTINEL);
+    }
+    let suite = CipherSuiteId::XChaCha20Poly1305;
+    let cipher = VaultCipher::new(suite, &DEK_SENTINEL);
+    let header = VaultHeader::new(1, suite.as_u8(), 3);
+    let entries = [EntrySource {
+        entry_id: [7u8; 16],
+        data: &plaintext,
+    }];
+    let mut counter = 0u8;
+    let rng = move |buf: &mut [u8]| {
+        counter = counter.wrapping_add(1);
+        buf.fill(counter);
+        Ok(())
+    };
+
+    // 1. 暗号化: ヒープ上の一時領域 (マニフェストなど) の解放時に、平文と DEK が残らないこと。
+    //    作業領域はスタック上の SecretBytes で、このアロケータ検査では消去を確認できない。
+    let records = run_with_heap_leak_check(&[&PLAINTEXT_SENTINEL, &DEK_SENTINEL], 1, || {
+        seal_entries(&cipher, &header, &entries, rng).expect("エントリの暗号化に成功。")
+    });
+
+    // 2. 復号の成功: 連結用の SecretVec が破棄された後に、平文がヒープに残らないこと。
+    run_with_heap_leak_check(&[&PLAINTEXT_SENTINEL, &DEK_SENTINEL], 1, || {
+        let opened = open_entries(&cipher, &header, &records).expect("エントリの復号に成功。");
+        assert_eq!(opened[0].data.as_slice(), plaintext.as_slice());
+        drop(opened);
+    });
+
+    // 3. 復号の失敗 (別世代のヘッダー): 最初のチャンクで認証に失敗し、ヒープを使わずに終わること。
+    //    (実測: 連結用の SecretVec は最初のチャンクを読むまで確保されず、解放は 0 回)
+    let stale_header = VaultHeader::new(1, suite.as_u8(), 2);
+    run_with_no_heap_dealloc(|| {
+        let err = open_entries(&cipher, &stale_header, &records)
+            .expect_err("別世代のヘッダーでの復号が成功してしまいました。");
+        assert_eq!(err, VaultError::AuthenticationFailed);
+    });
+
+    // 4. 復号の失敗 (末尾レコードの改ざん): 先頭のチャンクまで連結した平文が、失敗時にヒープへ残らないこと。
+    let mut tampered = records.clone();
+    if let Some(TlvRecord::Entry(payload)) = tampered.last_mut() {
+        payload.auth_tag[0] ^= 1;
+    }
+    run_with_heap_leak_check(&[&PLAINTEXT_SENTINEL, &DEK_SENTINEL], 1, || {
+        let err = open_entries(&cipher, &header, &tampered)
+            .expect_err("改ざんされたレコードの復号が成功してしまいました。");
+        assert_eq!(err, VaultError::AuthenticationFailed);
+    });
+}

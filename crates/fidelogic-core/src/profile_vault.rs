@@ -12,6 +12,7 @@
 //! 全ライフサイクル管理 (作成・スロット更新・暗号化エントリ格納・安全なゼロ消去) を提供する。
 
 pub use crate::cipher::*;
+pub use crate::entry::*;
 pub use crate::envelope::*;
 pub use crate::error::{CryptoError, PrecisError, SystemError, TlvParseError, VaultError};
 pub use crate::kdf::*;
