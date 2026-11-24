@@ -146,6 +146,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bpaf"
+version = "0.9.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "597e81e56404b7a3e26ef7b449f82a4b7a661ae76c3cac692b42d6bad06a0fbe"
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -338,6 +344,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 name = "fidelogic-cli"
 version = "0.1.0"
 dependencies = [
+ "bpaf",
  "fidelogic-core",
  "libc",
 ]

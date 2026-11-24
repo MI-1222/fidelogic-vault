@@ -163,7 +163,9 @@ fn test_harden_process_applies_protections_in_isolated_process() -> TestResult {
 
 #[test]
 fn test_binary_runs_after_hardening_and_prints_profile() -> TestResult {
-    let output = Command::new(env!("CARGO_BIN_EXE_fidelogic-cli")).output()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_fidelogic-cli"))
+        .arg("--version")
+        .output()?;
     assert!(
         output.status.success(),
         "実行ファイルの起動に失敗しました。stderr:\n{}",
@@ -171,7 +173,7 @@ fn test_binary_runs_after_hardening_and_prints_profile() -> TestResult {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.starts_with("fidelogic-cli (fidelogic-core: "),
+        stdout.contains("(fidelogic-core: "),
         "プロファイル表示の確認に失敗しました: {stdout}",
     );
     assert!(

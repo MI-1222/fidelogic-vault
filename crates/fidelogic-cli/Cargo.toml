@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 fidelogic-core = { workspace = true, features = ["std", "profile-vault", "memlock", "parallel"] }
 libc = { workspace = true }
+bpaf = { version = "0.9", default-features = false }
 
 [lints.clippy]
 unwrap_used = "deny"
