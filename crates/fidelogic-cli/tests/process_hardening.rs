@@ -8,7 +8,7 @@ use std::error::Error;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-use fidelogic_cli::hardening::harden_process;
+use fidelogic_cli::sys::process::harden_process;
 
 type TestResult = Result<(), Box<dyn Error>>;
 

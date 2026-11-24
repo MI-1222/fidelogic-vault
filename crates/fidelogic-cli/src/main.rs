@@ -2,6 +2,8 @@
 //!
 //! 処理の本体は [`fidelogic_cli::run`] にある。ここでは呼び出して終了コードを返すだけとする。
 
+#![deny(unsafe_code)]
+
 use std::process::ExitCode;
 
 /// CLI アプリケーションのエントリポイント。
