@@ -3,6 +3,13 @@ name = "fidelogic-cli"
 description = "Native command-line interface for fidelogic-vault"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [dependencies]
-fidelogic-core = { workspace = true, features = ["profile-vault"] }
+fidelogic-core = { workspace = true, features = ["std", "profile-vault", "memlock", "parallel"] }
+libc = { workspace = true }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
