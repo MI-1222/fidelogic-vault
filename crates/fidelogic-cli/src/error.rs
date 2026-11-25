@@ -25,6 +25,7 @@ use crate::sys::process::HardeningError;
 use crate::sys::signal::SignalError;
 use crate::sys::storage::StorageError;
 use crate::sys::tty::TtyError;
+use crate::vault_file::VaultFileError;
 
 /// 認証の失敗を表すメッセージ。失敗の理由によらず、この文言だけを表示する。
 pub const AUTHENTICATION_FAILED_MESSAGE: &str = "Vault の解錠に失敗しました。";
@@ -45,7 +46,7 @@ pub enum CliError {
     RollbackDetected,
     /// エンジンの状態遷移が不正である (内部の誤り)。
     InvalidState,
-    /// パスワードの入力に失敗した。中断を含む。
+    /// パスワードなどの秘密や、確認の応答の入力に失敗した。中断を含む。
     SecretInput(SecretInputError),
     /// 標準出力への書き込みに失敗した。
     OutputFailed,
@@ -71,16 +72,28 @@ pub enum CliError {
     KitPathConflictsWithVault,
     /// 利用者がリカバリーコードを控えたことを確認できなかった。
     RecoveryKitNotConfirmed,
-    /// 新しいパスワードを正準化できない。
+    /// 入力されたマスターパスワードを正準化できない。
     Password(PasswordError),
     /// 2 回入力した新しいパスワードが一致しない。
     PasswordMismatch,
-    /// リカバリーコードの生成に失敗した。
+    /// リカバリーコードの生成または読み取りに失敗した。
     RecoveryCode(RecoveryCodeError),
     /// 乱数の取得に失敗した。
     EntropySourceFailed,
     /// Vault の作成に必要な暗号処理に失敗した。
     VaultCreationFailed,
+    /// 読み込む Vault のパスに、ファイルが無い。
+    VaultNotFound,
+    /// Vault の保存を中止した (外部の変更、世代の上限など)。
+    VaultFile(VaultFileError),
+    /// Vault の保存に必要な暗号処理に失敗した。
+    VaultSaveFailed,
+    /// リカバリーコードの入力の前に、端末の入力が終わった。
+    RecoveryCodeNotEntered,
+    /// WebAuthn PRF のスロットがある Vault で、非対話の実行に `--drop-prf-slot` の指定が無い。
+    PrfSlotRequiresDrop,
+    /// WebAuthn PRF のスロットの破棄に、利用者が同意しなかった。
+    PrfSlotDropDeclined,
 }
 
 impl CliError {
@@ -132,6 +145,45 @@ impl CliError {
         }
     }
 
+    /// 既存の Vault の読み込みで起きた [`VaultFileError`] を変換する。
+    ///
+    /// # Returns
+    ///
+    /// ファイルの操作の失敗は [`CliError::Storage`]、解析の失敗は [`CliError::from_unlock_error`] の値、
+    /// それ以外は [`CliError::VaultFile`]。
+    #[must_use]
+    pub const fn from_load_error(error: VaultFileError) -> Self {
+        match error {
+            VaultFileError::Storage(error) => Self::Storage(error),
+            VaultFileError::Vault(error) => Self::from_unlock_error(error),
+            VaultFileError::ModifiedExternally
+            | VaultFileError::PathMismatch
+            | VaultFileError::EpochExhausted => Self::VaultFile(error),
+        }
+    }
+
+    /// Vault の保存で起きた [`VaultFileError`] を変換する。
+    ///
+    /// # Returns
+    ///
+    /// ファイルの操作の失敗は [`CliError::Storage`]、世代の巻き戻しは [`CliError::RollbackDetected`]、
+    /// 乱数の取得の失敗は [`CliError::EntropySourceFailed`]、
+    /// その他の暗号処理と直列化の失敗は [`CliError::VaultSaveFailed`]、それ以外は [`CliError::VaultFile`]。
+    #[must_use]
+    pub const fn from_save_error(error: VaultFileError) -> Self {
+        match error {
+            VaultFileError::Storage(error) => Self::Storage(error),
+            VaultFileError::Vault(VaultError::RollbackDetected) => Self::RollbackDetected,
+            VaultFileError::Vault(VaultError::System(SystemError::EntropySourceFailed)) => {
+                Self::EntropySourceFailed
+            }
+            VaultFileError::Vault(_) => Self::VaultSaveFailed,
+            VaultFileError::ModifiedExternally
+            | VaultFileError::PathMismatch
+            | VaultFileError::EpochExhausted => Self::VaultFile(error),
+        }
+    }
+
     /// 終了コードの分類を返す。
     ///
     /// # Returns
@@ -167,7 +219,13 @@ impl CliError {
             | Self::PasswordMismatch
             | Self::RecoveryCode(_)
             | Self::EntropySourceFailed
-            | Self::VaultCreationFailed => ExitCategory::Failure,
+            | Self::VaultCreationFailed
+            | Self::VaultNotFound
+            | Self::VaultFile(_)
+            | Self::VaultSaveFailed
+            | Self::RecoveryCodeNotEntered
+            | Self::PrfSlotRequiresDrop
+            | Self::PrfSlotDropDeclined => ExitCategory::Failure,
         }
     }
 }
@@ -240,9 +298,9 @@ impl fmt::Display for CliError {
             Self::Interrupted => formatter.write_str("処理を中断しました。"),
             Self::Signal(error) => write!(formatter, "{error}"),
             Self::Terminal(error) => write!(formatter, "{error}"),
-            Self::TerminalRequired => formatter.write_str(
-                "リカバリーコードの表示と確認に端末が必要です。端末から実行してください。",
-            ),
+            Self::TerminalRequired => {
+                formatter.write_str("この操作には端末が必要です。端末から実行してください。")
+            }
             Self::Storage(error) => write!(formatter, "{error}"),
             Self::VaultPathRequired => {
                 formatter.write_str("`--vault <PATH>` で Vault のパスを指定してください。")
@@ -250,19 +308,33 @@ impl fmt::Display for CliError {
             Self::VaultAlreadyExists => formatter
                 .write_str("Vault のパスにファイルがすでに存在するため、作成を中止しました。"),
             Self::KitAlreadyExists => formatter.write_str(
-                "リカバリーキットの出力先にファイルがすでに存在するため、作成を中止しました。",
+                "リカバリーキットの出力先にファイルがすでに存在するため、処理を中止しました。",
             ),
             Self::KitPathConflictsWithVault => formatter.write_str(
                 "リカバリーキットの出力先が Vault のパスと重なっています。別のパスを指定してください。",
             ),
             Self::RecoveryKitNotConfirmed => formatter.write_str(
-                "リカバリーコードの控えを確認できないため、作成を中止しました。表示したコードは使えません。",
+                "リカバリーコードの控えを確認できないため、処理を中止しました。表示したコードは使えません。",
             ),
             Self::Password(error) => write!(formatter, "{error}"),
             Self::PasswordMismatch => formatter.write_str("入力した 2 つのパスワードが一致しません。"),
             Self::RecoveryCode(error) => write!(formatter, "{error}"),
             Self::EntropySourceFailed => formatter.write_str("乱数の取得に失敗しました。"),
             Self::VaultCreationFailed => formatter.write_str("Vault の作成に失敗しました。"),
+            Self::VaultNotFound => formatter.write_str("指定されたパスに Vault がありません。"),
+            Self::VaultFile(error) => write!(formatter, "{error}"),
+            Self::VaultSaveFailed => {
+                formatter.write_str("Vault の保存に必要な暗号処理に失敗しました。")
+            }
+            Self::RecoveryCodeNotEntered => {
+                formatter.write_str("リカバリーコードの入力が途中で終了しました。")
+            }
+            Self::PrfSlotRequiresDrop => formatter.write_str(
+                "Vault に WebAuthn PRF のスロットがあるため中止しました。破棄して続ける場合は `--drop-prf-slot` を指定してください。",
+            ),
+            Self::PrfSlotDropDeclined => formatter.write_str(
+                "WebAuthn PRF のスロットを破棄しないため、鍵の更新を中止しました。",
+            ),
         }
     }
 }
@@ -281,6 +353,7 @@ mod tests {
     use crate::sys::signal::SignalError;
     use crate::sys::storage::StorageError;
     use crate::sys::tty::TtyError;
+    use crate::vault_file::VaultFileError;
 
     /// 認証の失敗にまとめるべき `VaultError` の全バリアント。
     ///
@@ -410,6 +483,12 @@ mod tests {
             CliError::RecoveryCode(RecoveryCodeError::MemoryLockFailed),
             CliError::EntropySourceFailed,
             CliError::VaultCreationFailed,
+            CliError::VaultNotFound,
+            CliError::VaultFile(VaultFileError::ModifiedExternally),
+            CliError::VaultSaveFailed,
+            CliError::RecoveryCodeNotEntered,
+            CliError::PrfSlotRequiresDrop,
+            CliError::PrfSlotDropDeclined,
         ];
         for error in errors {
             let message = error.to_string();
@@ -441,6 +520,12 @@ mod tests {
             CliError::from(StorageError::Locked),
             CliError::EntropySourceFailed,
             CliError::VaultCreationFailed,
+            CliError::VaultNotFound,
+            CliError::VaultFile(VaultFileError::EpochExhausted),
+            CliError::VaultSaveFailed,
+            CliError::RecoveryCodeNotEntered,
+            CliError::PrfSlotRequiresDrop,
+            CliError::PrfSlotDropDeclined,
         ] {
             assert_eq!(
                 error.exit_category(),
@@ -468,6 +553,74 @@ mod tests {
                 expected,
                 "{error:?} の変換に失敗。"
             );
+        }
+    }
+
+    /// 保存を中止する理由のうち、`CliError` に固有の分類を持たないもの。
+    const VAULT_FILE_ERRORS: [VaultFileError; 3] = [
+        VaultFileError::ModifiedExternally,
+        VaultFileError::PathMismatch,
+        VaultFileError::EpochExhausted,
+    ];
+
+    /// 読み込みの解析の失敗は、解錠の失敗と同じ出力にすること。
+    #[test]
+    fn test_load_errors_are_masked_like_unlock_errors() {
+        for error in errors_masked_as_authentication_failure() {
+            assert_eq!(
+                CliError::from_load_error(VaultFileError::Vault(error)),
+                CliError::AuthenticationFailed,
+                "{error:?} の変換に失敗。"
+            );
+        }
+        assert_eq!(
+            CliError::from_load_error(VaultFileError::Storage(StorageError::Locked)),
+            CliError::Storage(StorageError::Locked)
+        );
+        for error in VAULT_FILE_ERRORS {
+            assert_eq!(
+                CliError::from_load_error(error),
+                CliError::VaultFile(error),
+                "{error:?} の変換に失敗。"
+            );
+        }
+    }
+
+    /// 保存の失敗は、解錠の失敗のメッセージにまとめないこと。
+    #[test]
+    fn test_save_errors_are_not_reported_as_authentication_failure() {
+        for error in errors_masked_as_authentication_failure() {
+            let expected = if error == VaultError::System(SystemError::EntropySourceFailed) {
+                CliError::EntropySourceFailed
+            } else {
+                CliError::VaultSaveFailed
+            };
+            assert_eq!(
+                CliError::from_save_error(VaultFileError::Vault(error)),
+                expected,
+                "{error:?} の変換に失敗。"
+            );
+        }
+        assert_eq!(
+            CliError::from_save_error(VaultFileError::Vault(VaultError::RollbackDetected)),
+            CliError::RollbackDetected
+        );
+        assert_eq!(
+            CliError::from_save_error(VaultFileError::Vault(VaultError::InvalidState)),
+            CliError::VaultSaveFailed
+        );
+        assert_eq!(
+            CliError::from_save_error(VaultFileError::Storage(StorageError::Locked)),
+            CliError::Storage(StorageError::Locked)
+        );
+        for error in VAULT_FILE_ERRORS {
+            let converted = CliError::from_save_error(error);
+            assert_eq!(
+                converted,
+                CliError::VaultFile(error),
+                "{error:?} の変換に失敗。"
+            );
+            assert_eq!(converted.to_string(), error.to_string());
         }
     }
 

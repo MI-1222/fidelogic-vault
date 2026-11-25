@@ -7,12 +7,17 @@
 //! 本ツールは、ファイルシステム上に永続化された暗号化ストレージ (Vault) の作成、スロット構成の更新
 //! (Argon2id パスワード、WebAuthn PRF 鍵、リカバリーコード)、機密エントリの安全な格納・抽出を
 //! コマンドラインから実行するための管理者向けインターフェースを目指している。
-//! 実行できるサブコマンドは、Vault を作成してリカバリーキットを表示する `init` ([`init`]) と、
-//! クリップボードへのコピーが内部で起動する隠しサブコマンド `__clipboard-worker` である。
+//! 実行できるサブコマンドは次のとおりである。
+//!
+//! - `init`: Vault を作成してリカバリーキットを表示する ([`init`])。
+//! - `recover`: リカバリーコードで解錠し、マスターパスワードを再設定する ([`recover`])。
+//! - `rotate-key`: スロットの鍵、または DEK を更新する ([`rotate_key`])。
+//! - `__clipboard-worker`: クリップボードへのコピーが内部で起動する隠しサブコマンド。
+//!
 //! 他のサブコマンドは解析まで行い、実行すると「未実装」のエラーを返す。
 //!
-//! エントリの操作、解錠、鍵の更新に使う部品のうち、世代を検証する読み込みと保存 ([`vault_file`])、
-//! クリップボードへのコピーと自動消去 ([`sys::clipboard`]) は実装済みだが、呼び出すサブコマンドはまだ無い。
+//! エントリの操作に使う部品のうち、クリップボードへのコピーと自動消去 ([`sys::clipboard`]) は実装済みだが、
+//! 呼び出すサブコマンドはまだ無い。
 //!
 //! 実行ファイル (`main.rs`) は [`run`] を呼ぶだけの薄い入口であり、処理の本体はこのライブラリに置く。
 //! これにより、統合テストから各処理を直接呼び出せる。
@@ -51,15 +56,17 @@
 //!   ([`sys::storage::VaultLock`])。ロックを取得しないプログラムによる読み書きは防げない。
 //! - **アトミックな作成と保存 (実装済み)**: 一時ファイルへの書き込み、永続化、改名、親ディレクトリの同期の順で書く。
 //!   `init` は、既存のファイルを置き換えない改名で作成する ([`sys::storage::create_vault_file_atomically`])。
-//! - **世代の二重検証 (実装済み、サブコマンドからは未使用)**: 保存の直前にディスク上の Vault を読み直し、
+//! - **世代の二重検証 (実装済み)**: `recover` と `rotate-key` は、保存の直前にディスク上の Vault を読み直し、
 //!   読み込み時と異なれば中止する ([`vault_file::save_vault`])。
+//! - **鍵の更新 (実装済み)**: 利用者がリカバリーコードを控えたことを確認するまで Vault を書き換えず、
+//!   スロットの更新と全エントリの再暗号化を 1 回の保存で置き換える ([`rekey`], [`recover`], [`rotate_key`])。
 //! - **クリップボード (実装済み、サブコマンドからは未使用)**: 秘密のコピーは、自分自身を起動したワーカープロセスが行い、
 //!   30 秒後に、内容が変わっていなければ消去する。秘密のフィールドは履歴からの除外を指定する ([`sys::clipboard`])。
 //!   除外の指定を無視するクリップボードマネージャーには防御できない。
 //! - **リカバリーコード (実装済み)**: 128 bit の乱数にチェックサムを付けた、30 文字のコードを作る
 //!   ([`recovery_code::RecoveryCode`])。乱数は OS から取得する ([`sys::random::fill_random`])。
-//!   `init` は端末の代替画面に表示し、末尾の再入力を確認してから Vault を作成する ([`init`], [`recovery_kit`])。
-//!   入力されたコードの読み取り (誤読しやすい文字の読み替えと、チェックサムの検証) を使うサブコマンドはまだ無い。
+//!   発行するサブコマンドは端末の代替画面に表示し、末尾の再入力を確認してから Vault を書き込む ([`init`], [`recovery_kit`])。
+//!   `recover` は、入力されたコードのチェックサムを鍵導出より前に検証する。
 //! - **メモリ保護 (一部実装)**: パスワードの入力バッファとリカバリーコードは `fidelogic_core` の `LockedBuffer` に置き、
 //!   `mlock` (スワップアウト抑止) に失敗した場合は処理を中止する。
 //!   DEK、正準化したパスワード、鍵導出の作業領域は `mlock` せず、破棄時に消去する。
@@ -76,9 +83,14 @@ pub mod args;
 pub mod error;
 pub mod exit;
 pub mod init;
+mod interaction;
+mod key_update;
 pub mod password;
+pub mod recover;
 pub mod recovery_code;
 pub mod recovery_kit;
+pub mod rekey;
+pub mod rotate_key;
 pub mod secret_input;
 pub mod sys;
 pub mod vault_file;
@@ -91,6 +103,8 @@ use crate::args::{CommandLine, ParseExit, Subcommand};
 use crate::error::CliError;
 use crate::exit::ExitCategory;
 use crate::init::InitRequest;
+use crate::recover::RecoverRequest;
+use crate::rotate_key::RotateKeyRequest;
 
 /// 標準エラー出力のメッセージの先頭に付けるプログラム名。
 pub const PROGRAM_NAME: &str = "fidelogic-cli";
@@ -158,7 +172,7 @@ pub fn run_with_args(
 /// # Errors
 ///
 /// サブコマンドの失敗を [`CliError`] で返す。
-/// 現時点では、`init` と内部用の `__clipboard-worker` 以外のサブコマンドが [`CliError::NotImplemented`] を返す。
+/// `init`、`recover`、`rotate-key`、内部用の `__clipboard-worker` 以外のサブコマンドは、[`CliError::NotImplemented`] を返す。
 fn execute(
     command_line: &CommandLine,
     stdout: &mut impl Write,
@@ -169,6 +183,29 @@ fn execute(
             InitRequest {
                 vault: command_line.vault.as_deref(),
                 password_source: &command_line.password_source,
+                kit_html: kit_html.as_deref(),
+            },
+            stdout,
+            stderr,
+        ),
+        Subcommand::Recover {
+            keep_recovery_code,
+            kit_html,
+        } => recover::run(
+            RecoverRequest {
+                vault: command_line.vault.as_deref(),
+                password_source: &command_line.password_source,
+                keep_recovery_code: *keep_recovery_code,
+                kit_html: kit_html.as_deref(),
+            },
+            stdout,
+            stderr,
+        ),
+        Subcommand::RotateKey { mode, kit_html } => rotate_key::run(
+            RotateKeyRequest {
+                vault: command_line.vault.as_deref(),
+                password_source: &command_line.password_source,
+                mode: *mode,
                 kit_html: kit_html.as_deref(),
             },
             stdout,
@@ -285,16 +322,18 @@ mod tests {
         Ok(())
     }
 
-    /// `--vault` の指定が無い `init` は、端末やファイルに触れる前に引数の誤りになること。
+    /// `--vault` が必須のサブコマンドは、指定が無ければ、端末やファイルに触れる前に引数の誤りになること。
     #[test]
-    fn test_init_without_vault_is_a_usage_error() -> TestResult {
-        let (category, stdout, stderr) = run_strs(&["init"])?;
-        assert_eq!(category, ExitCategory::Usage);
-        assert!(stdout.is_empty());
-        assert_eq!(
-            stderr,
-            format!("{PROGRAM_NAME}: `--vault <PATH>` で Vault のパスを指定してください。\n")
-        );
+    fn test_missing_vault_is_a_usage_error() -> TestResult {
+        for name in ["init", "recover", "rotate-key"] {
+            let (category, stdout, stderr) = run_strs(&[name])?;
+            assert_eq!(category, ExitCategory::Usage, "{name} の分類の確認に失敗。");
+            assert!(stdout.is_empty());
+            assert_eq!(
+                stderr,
+                format!("{PROGRAM_NAME}: `--vault <PATH>` で Vault のパスを指定してください。\n")
+            );
+        }
         Ok(())
     }
 

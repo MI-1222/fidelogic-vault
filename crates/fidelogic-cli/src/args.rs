@@ -14,9 +14,9 @@
 //! | `get` | `<ENTRY>` | エントリを表示する |
 //! | `set` | `<ENTRY>` | エントリを追加・更新する |
 //! | `delete` | `<ENTRY>` | エントリを削除する |
-//! | `rotate-key` | `--kek-only` (既定) または `--full-dek [--drop-prf-slot]` | 鍵を更新する |
+//! | `rotate-key` | `--kek-only` (既定) `[--new-recovery-code]` または `--full-dek [--drop-prf-slot]`、`--kit-html <PATH>` (任意) | 鍵を更新する |
 //! | `export` | | Vault の内容を書き出す |
-//! | `recover` | | リカバリーコードで解錠し、マスターパスワードを再設定する |
+//! | `recover` | `--keep-recovery-code` (任意)、`--kit-html <PATH>` (任意) | リカバリーコードで解錠し、マスターパスワードを再設定する |
 //!
 //! このほかに、ヘルプに表示しない内部用のサブコマンド `__clipboard-worker` がある。
 //! クリップボードへコピーする処理が自分自身を起動するためのもので、利用者が直接使うものではない。
@@ -25,7 +25,10 @@
 //! すべてのサブコマンドが `--vault <PATH>` と、パスワードの入力元の指定を受け付ける。
 //! 指定はサブコマンド名の後に置く。
 //! (`fidelogic-cli get --vault ./my.vault github`)。省略したときの既定のパスは、Vault を読み書きする処理で決める。
-//! `init` は省略を認めない。
+//! `init`、`recover`、`rotate-key` は省略を認めない。
+//!
+//! `--kit-html` は、リカバリーコードを発行する場合 (`init`、`--keep-recovery-code` の無い `recover`、
+//! `--new-recovery-code` または `--full-dek` の `rotate-key`) だけ受け付ける。
 //!
 //! ## パスワードの入力元
 //!
@@ -35,6 +38,9 @@
 //! | `--password-stdin` | 標準入力 |
 //! | `--password-file <PATH>` | ファイル (グループと他者の権限が無いこと) |
 //! | `--password-fd <FD>` | 引き継いだファイル記述子 |
+//!
+//! `rotate-key` の指定は現在のパスワードの入力元で、新しいパスワードは端末で入力する。
+//! `recover` の指定は新しいパスワードの入力元で、リカバリーコードは端末で入力する。
 //!
 //! 3 つの指定は同時に使えない。`unlock` は標準入力をコマンドの入力に使うため、
 //! `--password-stdin` と `--password-fd 0` を拒否する。読み込みは [`crate::secret_input`] が行う。
@@ -99,11 +105,18 @@ pub enum Subcommand {
     RotateKey {
         /// 更新の方式。
         mode: RotateMode,
+        /// `--kit-html`: 再発行するリカバリーキットを、画面の表示に加えて HTML ファイルにも書き出す場合の出力先。
+        kit_html: Option<PathBuf>,
     },
     /// `export`: Vault の内容を書き出す。
     Export,
     /// `recover`: リカバリーコードで解錠し、マスターパスワードを再設定する。
-    Recover,
+    Recover {
+        /// `--keep-recovery-code`: リカバリーコードを再発行せず、使ったコードを残す。
+        keep_recovery_code: bool,
+        /// `--kit-html`: 再発行するリカバリーキットを、画面の表示に加えて HTML ファイルにも書き出す場合の出力先。
+        kit_html: Option<PathBuf>,
+    },
     /// `__clipboard-worker`: クリップボードへコピーし、一定時間の後に消去する内部用のワーカー。
     ///
     /// ヘルプに表示しない。`--vault` とパスワードの入力元の指定は受け付けない。
@@ -126,7 +139,7 @@ impl Subcommand {
             Self::Delete { .. } => "delete",
             Self::RotateKey { .. } => "rotate-key",
             Self::Export => "export",
-            Self::Recover => "recover",
+            Self::Recover { .. } => "recover",
             Self::ClipboardWorker { .. } => WORKER_SUBCOMMAND,
         }
     }
@@ -136,12 +149,26 @@ impl Subcommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotateMode {
     /// `--kek-only` (既定): DEK を変えずに、スロットの KEK だけを更新する。
-    KekOnly,
+    KekOnly {
+        /// `--new-recovery-code`: リカバリーコード (Slot 2) も再発行する。
+        new_recovery_code: bool,
+    },
     /// `--full-dek`: 新しい DEK で全エントリを再暗号化する。
     FullDek {
         /// `--drop-prf-slot`: WebAuthn PRF のスロット (Slot 1) を、確認せずに破棄する。
         drop_prf_slot: bool,
     },
+}
+
+impl RotateMode {
+    /// リカバリーコードを再発行する方式かを返す。`--full-dek` は常に再発行する。
+    #[must_use]
+    pub const fn issues_recovery_code(self) -> bool {
+        match self {
+            Self::KekOnly { new_recovery_code } => new_recovery_code,
+            Self::FullDek { .. } => true,
+        }
+    }
 }
 
 /// 解析を終えて、サブコマンドを実行せずに終了する場合の内容。
@@ -223,14 +250,14 @@ fn parser() -> OptionParser<CommandLine> {
     );
     let rotate_key = subcommand(
         "rotate-key",
-        "鍵を更新する",
-        rotate_mode().map(|mode| Subcommand::RotateKey { mode }),
+        "鍵を更新する (--vault の指定が必須。--password-* は現在のパスワードの入力元)",
+        rotate_key_arguments(),
     );
     let export = subcommand("export", "Vault の内容を書き出す", pure(Subcommand::Export));
     let recover = subcommand(
         "recover",
-        "リカバリーコードで解錠し、マスターパスワードを再設定する",
-        pure(Subcommand::Recover),
+        "リカバリーコードで解錠し、マスターパスワードを再設定する (--vault の指定が必須。--password-* は新しいパスワードの入力元)",
+        recover_arguments(),
     );
 
     let clipboard_worker = clipboard_worker();
@@ -357,12 +384,41 @@ fn password_source_options() -> impl Parser<PasswordSource> {
     construct!([standard_input, file, descriptor]).fallback(PasswordSource::Terminal)
 }
 
-/// `init` の `--kit-html <PATH>` の定義。
+/// `--kit-html <PATH>` の定義。`init` と、リカバリーコードを再発行するサブコマンドで使う。
 fn kit_html_option() -> impl Parser<Option<PathBuf>> {
     long("kit-html")
         .help("リカバリーキットを HTML ファイル (権限 0600) にも書き出す。既存のファイルは上書きしない")
         .argument::<PathBuf>("PATH")
         .optional()
+}
+
+/// `recover` の指定。`--kit-html` は、リカバリーコードを再発行する場合だけ受け付ける。
+fn recover_arguments() -> impl Parser<Subcommand> {
+    let keep_recovery_code = long("keep-recovery-code")
+        .help("リカバリーコードを再発行せず、使ったコードを残す")
+        .switch();
+    let kit_html = kit_html_option();
+    construct!(keep_recovery_code, kit_html)
+        .guard(
+            |(keep_recovery_code, kit_html)| !*keep_recovery_code || kit_html.is_none(),
+            "`--kit-html` はリカバリーコードを再発行する場合だけ指定できます。`--keep-recovery-code` と同時に指定しないでください。",
+        )
+        .map(|(keep_recovery_code, kit_html)| Subcommand::Recover {
+            keep_recovery_code,
+            kit_html,
+        })
+}
+
+/// `rotate-key` の指定。`--kit-html` は、リカバリーコードを再発行する場合だけ受け付ける。
+fn rotate_key_arguments() -> impl Parser<Subcommand> {
+    let mode = rotate_mode();
+    let kit_html = kit_html_option();
+    construct!(mode, kit_html)
+        .guard(
+            |(mode, kit_html)| mode.issues_recovery_code() || kit_html.is_none(),
+            "`--kit-html` はリカバリーコードを再発行する場合 (`--new-recovery-code` または `--full-dek`) だけ指定できます。",
+        )
+        .map(|(mode, kit_html)| Subcommand::RotateKey { mode, kit_html })
 }
 
 /// `get` / `set` / `delete` が受け取る対象のエントリ。
@@ -374,19 +430,27 @@ fn entry_argument() -> impl Parser<String> {
 ///
 /// `--kek-only` と `--full-dek` は同時に指定できない。どちらも無い場合は `--kek-only` として扱う。
 /// `--drop-prf-slot` は `--full-dek` と組み合わせたときだけ受け付ける。
+/// `--new-recovery-code` は `--kek-only` (省略を含む) でだけ受け付ける。`--full-dek` は常に再発行する。
 fn rotate_mode() -> impl Parser<RotateMode> {
-    let kek_only = long("kek-only")
+    let kek_only_flag = long("kek-only")
         .help("DEK を変えずに、スロットの KEK だけを更新する (既定)")
-        .req_flag(RotateMode::KekOnly);
+        .req_flag(())
+        .optional();
+    let new_recovery_code = long("new-recovery-code")
+        .help("--kek-only と併用し、リカバリーコードも再発行する")
+        .switch();
+    let kek_only = construct!(kek_only_flag, new_recovery_code)
+        .map(|(_, new_recovery_code)| RotateMode::KekOnly { new_recovery_code });
     let full_dek_flag = long("full-dek")
-        .help("新しい DEK で全エントリを再暗号化する")
+        .help("新しい DEK で全エントリを再暗号化し、リカバリーコードを再発行する")
         .req_flag(());
     let drop_prf_slot = long("drop-prf-slot")
         .help("--full-dek と併用し、WebAuthn PRF のスロットを確認せずに破棄する")
         .switch();
     let full_dek = construct!(full_dek_flag, drop_prf_slot)
         .map(|((), drop_prf_slot)| RotateMode::FullDek { drop_prf_slot });
-    construct!([kek_only, full_dek]).fallback(RotateMode::KekOnly)
+    // `--kek-only` の側は、指定が何も無くても成功するため、`--full-dek` の側を先に置く。
+    construct!([full_dek, kek_only])
 }
 
 #[cfg(test)]
@@ -482,7 +546,7 @@ mod tests {
         expect_invalid(&["init", "--kit-html", "a", "--kit-html", "b"])?;
         expect_invalid(&["--kit-html", "a", "init"])?;
         for invocation in MINIMAL_INVOCATIONS {
-            if invocation != ["init"] {
+            if invocation != ["init"] && invocation != ["recover"] {
                 let args: Vec<&str> = invocation
                     .iter()
                     .chain(&["--kit-html", "a"])
@@ -571,11 +635,34 @@ mod tests {
         Ok(())
     }
 
+    /// `--new-recovery-code` を指定しない `--kek-only`。
+    const KEK_ONLY: RotateMode = RotateMode::KekOnly {
+        new_recovery_code: false,
+    };
+
     #[test]
     fn test_rotate_key_modes() -> TestResult {
-        let cases: [(&[&str], RotateMode); 5] = [
-            (&["rotate-key"], RotateMode::KekOnly),
-            (&["rotate-key", "--kek-only"], RotateMode::KekOnly),
+        let cases: [(&[&str], RotateMode); 8] = [
+            (&["rotate-key"], KEK_ONLY),
+            (&["rotate-key", "--kek-only"], KEK_ONLY),
+            (
+                &["rotate-key", "--new-recovery-code"],
+                RotateMode::KekOnly {
+                    new_recovery_code: true,
+                },
+            ),
+            (
+                &["rotate-key", "--kek-only", "--new-recovery-code"],
+                RotateMode::KekOnly {
+                    new_recovery_code: true,
+                },
+            ),
+            (
+                &["rotate-key", "--new-recovery-code", "--kek-only"],
+                RotateMode::KekOnly {
+                    new_recovery_code: true,
+                },
+            ),
             (
                 &["rotate-key", "--full-dek"],
                 RotateMode::FullDek {
@@ -598,7 +685,10 @@ mod tests {
         for (args, expected) in cases {
             assert_eq!(
                 parse_strs(args)?.subcommand,
-                Subcommand::RotateKey { mode: expected },
+                Subcommand::RotateKey {
+                    mode: expected,
+                    kit_html: None
+                },
                 "{args:?} の解析に失敗。",
             );
         }
@@ -610,6 +700,150 @@ mod tests {
         expect_invalid(&["rotate-key", "--kek-only", "--full-dek"])?;
         expect_invalid(&["rotate-key", "--drop-prf-slot"])?;
         expect_invalid(&["rotate-key", "--kek-only", "--drop-prf-slot"])?;
+        expect_invalid(&["rotate-key", "--full-dek", "--new-recovery-code"])?;
+        expect_invalid(&["rotate-key", "--new-recovery-code", "--full-dek"])?;
+        expect_invalid(&["rotate-key", "--new-recovery-code", "--drop-prf-slot"])?;
+        expect_invalid(&["rotate-key", "--new-recovery-code", "--new-recovery-code"])?;
+        expect_invalid(&["rotate-key", "--keep-recovery-code"])?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_recovery_code_is_issued_by_new_code_and_full_dek() {
+        let cases = [
+            (KEK_ONLY, false),
+            (
+                RotateMode::KekOnly {
+                    new_recovery_code: true,
+                },
+                true,
+            ),
+            (
+                RotateMode::FullDek {
+                    drop_prf_slot: false,
+                },
+                true,
+            ),
+            (
+                RotateMode::FullDek {
+                    drop_prf_slot: true,
+                },
+                true,
+            ),
+        ];
+        for (mode, expected) in cases {
+            assert_eq!(
+                mode.issues_recovery_code(),
+                expected,
+                "{mode:?} の判定に失敗。"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rotate_key_kit_html_requires_new_recovery_code() -> TestResult {
+        for args in [
+            &["rotate-key", "--new-recovery-code", "--kit-html", "kit"][..],
+            &["rotate-key", "--kit-html=kit", "--full-dek"],
+            &[
+                "rotate-key",
+                "--full-dek",
+                "--drop-prf-slot",
+                "--kit-html",
+                "kit",
+            ],
+        ] {
+            let Subcommand::RotateKey { kit_html, .. } = parse_strs(args)?.subcommand else {
+                return Err(format!("{args:?} の解析に失敗。").into());
+            };
+            assert_eq!(
+                kit_html,
+                Some(PathBuf::from("kit")),
+                "{args:?} の出力先の解析に失敗。"
+            );
+        }
+        for args in [
+            &["rotate-key", "--kit-html", "kit"][..],
+            &["rotate-key", "--kek-only", "--kit-html", "kit"],
+        ] {
+            let message = expect_invalid(args)?;
+            assert!(
+                message.contains("--kit-html"),
+                "{args:?} の理由の表示の確認に失敗: {message}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_recover_options() -> TestResult {
+        let cases: [(&[&str], bool, Option<&str>); 4] = [
+            (&["recover"], false, None),
+            (&["recover", "--keep-recovery-code"], true, None),
+            (&["recover", "--kit-html", "kit"], false, Some("kit")),
+            (
+                &["recover", "--vault", "v", "--kit-html=kit"],
+                false,
+                Some("kit"),
+            ),
+        ];
+        for (args, keep, kit) in cases {
+            assert_eq!(
+                parse_strs(args)?.subcommand,
+                Subcommand::Recover {
+                    keep_recovery_code: keep,
+                    kit_html: kit.map(PathBuf::from),
+                },
+                "{args:?} の解析に失敗。"
+            );
+        }
+        let message = expect_invalid(&["recover", "--keep-recovery-code", "--kit-html", "kit"])?;
+        assert!(
+            message.contains("--kit-html"),
+            "理由の表示の確認に失敗: {message}"
+        );
+        for args in [
+            &["recover", "--keep-recovery-code", "--keep-recovery-code"][..],
+            &["recover", "--keep-recovery-code=value"],
+            &["recover", "--kit-html"],
+            &["recover", "--kit-html", "a", "--kit-html", "b"],
+            &["recover", "--new-recovery-code"],
+            &["recover", "--full-dek"],
+        ] {
+            expect_invalid(args)?;
+        }
+        Ok(())
+    }
+
+    /// ヘルプで、必須の指定と、パスワードの入力元の意味を示すこと。
+    #[test]
+    fn test_rekey_help_states_requirements() -> TestResult {
+        let cases = [
+            (
+                "recover",
+                "新しいパスワードの入力元",
+                "--keep-recovery-code",
+            ),
+            (
+                "rotate-key",
+                "現在のパスワードの入力元",
+                "--new-recovery-code",
+            ),
+        ];
+        for (name, source, option) in cases {
+            let help = match parse_strs(&[name, "--help"]) {
+                Err(ParseExit::Help(text)) => text,
+                other => return Err(format!("{name} --help の解析に失敗: {other:?}").into()),
+            };
+            // 説明は端末の幅で折り返すため、空白と改行を除いて比較する。
+            let compact = |text: &str| text.split_whitespace().collect::<String>();
+            for text in ["--vault の指定が必須", source, option, "--kit-html"] {
+                assert!(
+                    compact(&help).contains(&compact(text)),
+                    "{name} のヘルプの {text} の確認に失敗: {help}"
+                );
+            }
+        }
         Ok(())
     }
 

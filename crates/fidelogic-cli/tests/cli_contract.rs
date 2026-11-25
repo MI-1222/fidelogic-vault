@@ -10,16 +10,15 @@ use std::process::{Command, Output};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// 本体が未実装のサブコマンドの起動。`init` の振る舞いは `tests/init.rs` で確かめる。
-const UNIMPLEMENTED_INVOCATIONS: [&[&str]; 8] = [
+/// 本体が未実装のサブコマンドの起動。`init`、`recover`、`rotate-key` の振る舞いは、
+/// サブコマンド名の統合テストで確かめる。
+const UNIMPLEMENTED_INVOCATIONS: [&[&str]; 6] = [
     &["unlock"],
     &["list"],
     &["get", "github"],
     &["set", "github"],
     &["delete", "github"],
-    &["rotate-key"],
     &["export"],
-    &["recover"],
 ];
 
 fn run_binary(args: &[&str]) -> std::io::Result<Output> {
@@ -61,13 +60,15 @@ fn test_help_and_version_exit_with_zero() -> TestResult {
 
 #[test]
 fn test_invalid_arguments_exit_with_two() -> TestResult {
-    let invalid: [&[&str]; 6] = [
+    let invalid: [&[&str]; 8] = [
         &[],
         &["open"],
         &["get"],
         &["init"],
         &["init", "--password", "hunter2"],
         &["rotate-key", "--kek-only", "--full-dek"],
+        &["rotate-key"],
+        &["recover"],
     ];
     for args in invalid {
         let output = run_binary(args)?;
@@ -111,6 +112,32 @@ fn test_unimplemented_subcommands_exit_with_one() -> TestResult {
                 "fidelogic-cli: サブコマンド `{}` はまだ実装されていません。\n",
                 args[0]
             ),
+        );
+    }
+    Ok(())
+}
+
+/// コードを再発行しない場合の `--kit-html` は、引数の誤りになること。
+///
+/// `--vault` の指定漏れも終了コード 2 になるため、理由の表示まで確かめる。
+#[test]
+fn test_kit_html_without_new_recovery_code_exits_with_two() -> TestResult {
+    let invalid: [&[&str]; 3] = [
+        &["recover", "--keep-recovery-code", "--kit-html", "kit"],
+        &["rotate-key", "--kit-html", "kit"],
+        &["rotate-key", "--kek-only", "--kit-html", "kit"],
+    ];
+    for args in invalid {
+        let output = run_binary(args)?;
+        let stderr = String::from_utf8(output.stderr.clone())?;
+        assert_eq!(
+            exit_code(&output)?,
+            2,
+            "{args:?} の終了コードの確認に失敗。"
+        );
+        assert!(
+            output.stdout.is_empty() && stderr.contains("リカバリーコードを再発行する場合"),
+            "{args:?} の理由の表示の確認に失敗: {stderr}",
         );
     }
     Ok(())

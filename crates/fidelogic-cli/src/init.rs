@@ -27,6 +27,9 @@
 //!
 //! HTML を確認より前に書き出すのは、書き込めない出力先を、利用者がコードを控える前に検出するためである。
 //!
+//! 画面の表示、控えの確認、HTML の後始末は、他のサブコマンドと共有する非公開のモジュール `interaction` が行う。
+//! 次の「端末の表示の限界」は、コードを再発行するサブコマンドにも当てはまる。
+//!
 //! ## 端末の表示の限界
 //!
 //! リカバリーキットは代替画面 (`ESC[?1049h`) に表示し、消去してから元の画面に戻る。
@@ -42,22 +45,22 @@ use std::io::Write;
 use std::path::Path;
 
 use fidelogic_core::{
-    Argon2Params, CipherSuiteId, DEK_LEN, SLOT0_NONCE_LEN, SLOT0_SALT_LEN, SLOT2_NONCE_LEN,
-    SLOT2_SALT_LEN, SecretBytes, SecretVec, SystemError, Vault, VaultCipher, VaultError,
-    VaultHeader, ct_eq_bytes_bool, seal_entries, serialize, wrap_dek_slot0_for_header,
-    wrap_dek_slot2_for_header,
+    Argon2Params, CipherSuiteId, DEK_LEN, SecretBytes, SystemError, Vault, VaultCipher, VaultError,
+    VaultHeader, seal_entries, serialize,
 };
 
 use crate::error::CliError;
-use crate::password::canonicalize_password;
+use crate::interaction::{
+    PendingKit, confirm_recovery_kit, ensure_kit_destination_is_free, ensure_not_interrupted,
+    read_new_password, report_kit, warn_if_directory_not_synced,
+};
 use crate::recovery_code::RecoveryCode;
-use crate::recovery_kit::{screen_parts, write_html};
-use crate::secret_input::{PasswordSource, SecretInputError, read_password};
+use crate::rekey::{new_password_slot, new_recovery_slot};
+use crate::secret_input::PasswordSource;
 use crate::sys::random::fill_random;
 use crate::sys::signal::InterruptWatcher;
 use crate::sys::storage::{
-    DirectorySync, StorageError, VaultLock, VaultPath, create_vault_file_atomically,
-    vault_file_exists, write_new_private_file,
+    StorageError, VaultLock, VaultPath, create_vault_file_atomically, vault_file_exists,
 };
 use crate::sys::tty::Terminal;
 
@@ -69,27 +72,6 @@ pub const INITIAL_EPOCH_ID: u64 = 1;
 
 /// 作成する Vault の暗号スイート。
 const CIPHER_SUITE: CipherSuiteId = CipherSuiteId::XChaCha20Poly1305;
-
-/// 端末からマスターパスワードを読み込むときのプロンプト。
-const NEW_PASSWORD_PROMPT: &str = "新しいマスターパスワード: ";
-
-/// 端末からマスターパスワードを再入力させるときのプロンプト。
-const REPEAT_PASSWORD_PROMPT: &str = "確認のため、もう一度入力してください: ";
-
-/// リカバリーコードの末尾を再入力させるときのプロンプト。
-const CONFIRMATION_PROMPT: &str = "末尾 5 文字 (入力は表示されません): ";
-
-/// 再入力が一致しなかったときに、画面の末尾に表示する案内。
-const MISMATCH_NOTICE: &str = "一致しません。もう一度入力してください。\n";
-
-/// 代替画面に切り替える制御列。
-const ENTER_ALTERNATE_SCREEN: &str = "\x1b[?1049h";
-
-/// カーソルを左上に移して画面を消去する制御列。
-const CLEAR_SCREEN: &str = "\x1b[H\x1b[2J";
-
-/// 画面を消去してから、元の画面に戻る制御列。
-const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[H\x1b[2J\x1b[?1049l";
 
 /// `init` サブコマンドの指定。
 #[derive(Debug, Clone, Copy)]
@@ -138,12 +120,7 @@ pub fn run(
     if vault_file_exists(&lock)? {
         return Err(CliError::VaultAlreadyExists);
     }
-    if request
-        .kit_html
-        .is_some_and(|path| path.symlink_metadata().is_ok())
-    {
-        return Err(CliError::KitAlreadyExists);
-    }
+    ensure_kit_destination_is_free(request.kit_html)?;
 
     let password = read_new_password(request.password_source, &watcher)?;
     let code = RecoveryCode::generate(fill_random)?;
@@ -210,197 +187,13 @@ where
     let mut dek = SecretBytes::<DEK_LEN>::zero();
     fill_random(dek.as_mut_slice())?;
 
-    // ソルトとノンスは秘密ではない。
-    let mut password_salt = [0u8; SLOT0_SALT_LEN];
-    let mut password_nonce = [0u8; SLOT0_NONCE_LEN];
-    fill_random(&mut password_salt)?;
-    fill_random(&mut password_nonce)?;
-    let mut recovery_salt = [0u8; SLOT2_SALT_LEN];
-    let mut recovery_nonce = [0u8; SLOT2_NONCE_LEN];
-    fill_random(&mut recovery_salt)?;
-    fill_random(&mut recovery_nonce)?;
-
-    let password_slot = wrap_dek_slot0_for_header(
-        &dek,
-        password,
-        &password_salt,
-        &password_nonce,
-        params,
-        &header,
-    )?;
-    // 正準化を伴う `wrap_dek_slot2_code_for_header` は、コードを `mlock` しないヒープに複写するため使わない。
-    // 正準形はコアの正準化で変化しないため、正準化を伴わない関数に渡しても同じ結果になる。
-    let recovery_slot = wrap_dek_slot2_for_header(
-        &dek,
-        recovery_code.as_bytes(),
-        &recovery_salt,
-        &recovery_nonce,
-        &header,
-    )?;
+    let password_slot = new_password_slot(&dek, &header, password, params, &mut fill_random)?;
+    let recovery_slot = new_recovery_slot(&dek, &header, recovery_code, &mut fill_random)?;
 
     let cipher = VaultCipher::new(CIPHER_SUITE, dek.as_bytes());
     let records = seal_entries(&cipher, &header, &[], fill_random)?;
     let vault = Vault::new(header, vec![password_slot, recovery_slot], records);
     serialize(&vault).map_err(VaultError::Parse)
-}
-
-/// マスターパスワードを読み込んで正準化する。端末の場合は 2 回入力させ、一致を確かめる。
-fn read_new_password(
-    source: &PasswordSource,
-    watcher: &InterruptWatcher,
-) -> Result<SecretVec, CliError> {
-    let password = read_canonical_password(source, NEW_PASSWORD_PROMPT, watcher)?;
-    if *source == PasswordSource::Terminal {
-        let repeated = read_canonical_password(source, REPEAT_PASSWORD_PROMPT, watcher)?;
-        if !ct_eq_bytes_bool(password.as_slice(), repeated.as_slice()) {
-            return Err(CliError::PasswordMismatch);
-        }
-    }
-    Ok(password)
-}
-
-/// パスワードを 1 回読み込んで正準化する。読み込んだ内容は、戻る前に消去する。
-fn read_canonical_password(
-    source: &PasswordSource,
-    prompt: &str,
-    watcher: &InterruptWatcher,
-) -> Result<SecretVec, CliError> {
-    let input = read_password(source, prompt, watcher)?;
-    Ok(canonicalize_password(input.as_bytes())?)
-}
-
-/// 中断のシグナルを受けていた場合は失敗する。
-fn ensure_not_interrupted(watcher: &InterruptWatcher) -> Result<(), CliError> {
-    if watcher.is_interrupted() {
-        Err(CliError::Interrupted)
-    } else {
-        Ok(())
-    }
-}
-
-/// 代替画面にリカバリーキットを表示し、コードの末尾が正しく再入力されるまで繰り返す。
-///
-/// 成否によらず、戻る前に画面を消去して元の画面に戻す。
-///
-/// # Args
-///
-/// - `grouped`: 表示用の、区切りを含むコード。
-///
-/// # Errors
-///
-/// - 再入力の前に端末の入力が終わった場合 (`Ctrl+D`、切断) は [`CliError::RecoveryKitNotConfirmed`]。
-/// - 中断のシグナルを受けた場合は、中断を示すエラー。
-/// - 端末の読み書きに失敗した場合は、対応するエラー。
-fn confirm_recovery_kit(
-    terminal: &Terminal,
-    grouped: &str,
-    code: &RecoveryCode,
-    watcher: &InterruptWatcher,
-) -> Result<(), CliError> {
-    let screen = AlternateScreen::enter(terminal, watcher)?;
-    let mut notice = "";
-    loop {
-        // 失敗の案内でコードが画面の外に流れないように、毎回描き直す。
-        screen.draw(screen_parts(grouped), notice)?;
-        // 読み込みの手順は、端末からのパスワードの入力と同じである。
-        match read_password(&PasswordSource::Terminal, CONFIRMATION_PROMPT, watcher) {
-            Ok(input) if code.confirms_suffix(input.as_bytes()) => return Ok(()),
-            Ok(_) | Err(SecretInputError::Empty | SecretInputError::TooLong) => {
-                notice = MISMATCH_NOTICE;
-            }
-            Err(SecretInputError::EndOfInput) => return Err(CliError::RecoveryKitNotConfirmed),
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-/// 端末の代替画面を使っている間だけ存在する値。破棄すると、画面を消去して元の画面に戻る。
-struct AlternateScreen<'a> {
-    terminal: &'a Terminal,
-    watcher: &'a InterruptWatcher,
-}
-
-impl<'a> AlternateScreen<'a> {
-    /// 代替画面に切り替える。
-    fn enter(terminal: &'a Terminal, watcher: &'a InterruptWatcher) -> Result<Self, CliError> {
-        // 切り替えの書き込みが途中で失敗しても、破棄の処理で元の画面に戻す。
-        let screen = Self { terminal, watcher };
-        screen.write(ENTER_ALTERNATE_SCREEN)?;
-        Ok(screen)
-    }
-
-    /// 画面を消去し、`parts` と `notice` を順に書く。
-    fn draw(&self, parts: [&str; 3], notice: &str) -> Result<(), CliError> {
-        self.write(CLEAR_SCREEN)?;
-        for part in parts {
-            self.write(part)?;
-        }
-        self.write(notice)
-    }
-
-    fn write(&self, text: &str) -> Result<(), CliError> {
-        if self.terminal.write(text, self.watcher)? {
-            Ok(())
-        } else {
-            Err(CliError::Interrupted)
-        }
-    }
-}
-
-impl Drop for AlternateScreen<'_> {
-    fn drop(&mut self) {
-        // 中断した後にも書き込めるように、中断の確認を伴わない書き込みを使う。
-        self.terminal.write_without_waiting(LEAVE_ALTERNATE_SCREEN);
-    }
-}
-
-/// 書き出した HTML のリカバリーキット。[`PendingKit::keep`] を呼ばずに破棄すると、ファイルを削除する。
-struct PendingKit<'a> {
-    path: &'a Path,
-    directory_sync: DirectorySync,
-    keep: bool,
-}
-
-impl<'a> PendingKit<'a> {
-    /// HTML を新規に書き出す。
-    fn write(path: &'a Path, grouped: &str) -> Result<Self, CliError> {
-        let directory_sync = write_new_private_file(path, |file| write_html(file, grouped))
-            .map_err(|error| match error {
-                StorageError::AlreadyExists => CliError::KitAlreadyExists,
-                other => CliError::from(other),
-            })?;
-        Ok(Self {
-            path,
-            directory_sync,
-            keep: false,
-        })
-    }
-
-    /// ファイルを残し、親ディレクトリの同期の結果を返す。
-    fn keep(mut self) -> DirectorySync {
-        self.keep = true;
-        self.directory_sync
-    }
-}
-
-impl Drop for PendingKit<'_> {
-    fn drop(&mut self) {
-        if !self.keep {
-            // 削除に失敗した場合も、元の失敗を報告する。残るコードに対応する Vault は存在しない。
-            let _ = std::fs::remove_file(self.path);
-        }
-    }
-}
-
-/// 親ディレクトリの同期に失敗した場合に、警告を書く。
-fn warn_if_directory_not_synced(stderr: &mut impl Write, sync: DirectorySync) {
-    if let DirectorySync::Failed { errno } = sync {
-        let message = format!(
-            "警告: 親ディレクトリの同期に失敗しました (errno: {errno})。直後に電源が切れると、作成したファイルが失われる可能性があります。"
-        );
-        // 警告の書き込みに失敗しても、作成の結果は変わらないため、結果を無視する。
-        let _ = crate::write_error_line(stderr, &message);
-    }
 }
 
 /// 作成の結果を書く。
@@ -410,14 +203,7 @@ fn report_created(
     kit_html: Option<&Path>,
 ) -> std::io::Result<()> {
     writeln!(stdout, "Vault を作成しました: {}", vault.display())?;
-    if let Some(path) = kit_html {
-        writeln!(
-            stdout,
-            "リカバリーキットを書き出しました: {}",
-            path.display()
-        )?;
-        writeln!(stdout, "印刷した後は、このファイルを削除してください。")?;
-    }
+    report_kit(stdout, kit_html)?;
     stdout.flush()
 }
 
@@ -431,11 +217,8 @@ mod tests {
         unwrap_dek_slot0_for_header, unwrap_dek_slot2_for_header,
     };
 
-    use super::{
-        INITIAL_EPOCH_ID, VAULT_FORMAT_VERSION, build_new_vault, warn_if_directory_not_synced,
-    };
+    use super::{INITIAL_EPOCH_ID, VAULT_FORMAT_VERSION, build_new_vault};
     use crate::recovery_code::RecoveryCode;
-    use crate::sys::storage::DirectorySync;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -474,26 +257,6 @@ mod tests {
             "末尾の余分なバイトが無いことの確認に失敗。"
         );
         Ok(vault)
-    }
-
-    #[test]
-    fn test_directory_sync_failure_is_warned_in_one_line() -> TestResult {
-        let mut stderr = Vec::new();
-        warn_if_directory_not_synced(&mut stderr, DirectorySync::Synced);
-        assert!(
-            stderr.is_empty(),
-            "同期の成功で警告しないことの確認に失敗。"
-        );
-
-        warn_if_directory_not_synced(&mut stderr, DirectorySync::Failed { errno: 5 });
-        let warning = String::from_utf8(stderr)?;
-        assert!(
-            warning.starts_with("fidelogic-cli: 警告: ")
-                && warning.contains("errno: 5")
-                && warning.lines().count() == 1,
-            "警告の出力の確認に失敗: {warning}"
-        );
-        Ok(())
     }
 
     #[test]

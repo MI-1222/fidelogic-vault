@@ -61,8 +61,8 @@ pub const MAX_VAULT_FILE_LEN: u64 = VAULT_HEADER_LEN as u64
 
 /// Vault ファイルの読み込みと保存の失敗。
 ///
-/// 終了コードと利用者へのメッセージへの対応付けは、呼び出し側のサブコマンドで行う。
-/// 読み込みで起きた [`VaultFileError::Vault`] は、解錠の失敗と同じく、理由を区別せずに表示する前提である。
+/// 終了コードと利用者へのメッセージへの対応付けは、[`crate::error::CliError::from_load_error`] と [`crate::error::CliError::from_save_error`] が行う。
+/// 読み込みで起きた [`VaultFileError::Vault`] は、解錠の失敗と同じく、理由を区別せずに表示する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultFileError {
     /// ファイルの読み書きに失敗した。
@@ -145,6 +145,12 @@ impl LoadedVault {
     #[must_use]
     pub fn path(&self) -> &VaultPath {
         &self.path
+    }
+
+    /// 読み込んだ Vault の全体を返す。解錠に使う。
+    #[must_use]
+    pub fn vault(&self) -> &Vault {
+        &self.vault
     }
 
     /// 読み込み時のヘッダーを返す。
