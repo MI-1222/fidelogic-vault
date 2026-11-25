@@ -18,6 +18,7 @@ use fidelogic_core::VaultError;
 
 use crate::exit::ExitCategory;
 use crate::secret_input::SecretInputError;
+use crate::sys::clipboard::ClipboardError;
 use crate::sys::process::HardeningError;
 
 /// 認証の失敗を表すメッセージ。失敗の理由によらず、この文言だけを表示する。
@@ -43,6 +44,8 @@ pub enum CliError {
     SecretInput(SecretInputError),
     /// 標準出力への書き込みに失敗した。
     OutputFailed,
+    /// クリップボードへのコピーに失敗した。
+    Clipboard(ClipboardError),
 }
 
 impl CliError {
@@ -90,7 +93,8 @@ impl CliError {
             | Self::NotImplemented(_)
             | Self::RollbackDetected
             | Self::InvalidState
-            | Self::OutputFailed => ExitCategory::Failure,
+            | Self::OutputFailed
+            | Self::Clipboard(_) => ExitCategory::Failure,
         }
     }
 }
@@ -104,6 +108,12 @@ impl From<HardeningError> for CliError {
 impl From<SecretInputError> for CliError {
     fn from(error: SecretInputError) -> Self {
         Self::SecretInput(error)
+    }
+}
+
+impl From<ClipboardError> for CliError {
+    fn from(error: ClipboardError) -> Self {
+        Self::Clipboard(error)
     }
 }
 
@@ -123,6 +133,7 @@ impl fmt::Display for CliError {
             Self::InvalidState => formatter.write_str("内部状態が不正なため、処理を中止しました。"),
             Self::SecretInput(error) => write!(formatter, "{error}"),
             Self::OutputFailed => formatter.write_str("標準出力への書き込みに失敗しました。"),
+            Self::Clipboard(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -134,6 +145,7 @@ mod tests {
     use super::{AUTHENTICATION_FAILED_MESSAGE, CliError};
     use crate::exit::ExitCategory;
     use crate::secret_input::SecretInputError;
+    use crate::sys::clipboard::ClipboardError;
     use crate::sys::process::{HardeningError, HardeningStep};
 
     /// 認証の失敗にまとめるべき `VaultError` の全バリアント。
@@ -248,6 +260,7 @@ mod tests {
             CliError::InvalidState,
             CliError::SecretInput(SecretInputError::Interrupted),
             CliError::OutputFailed,
+            CliError::Clipboard(ClipboardError::Unavailable),
         ];
         for error in errors {
             let message = error.to_string();
@@ -256,6 +269,14 @@ mod tests {
                 "{error:?} の文末の確認に失敗: {message}"
             );
         }
+    }
+
+    #[test]
+    fn test_clipboard_error_is_general_failure_with_its_message() {
+        let error = CliError::from(ClipboardError::Unavailable);
+        assert_eq!(error, CliError::Clipboard(ClipboardError::Unavailable));
+        assert_eq!(error.to_string(), ClipboardError::Unavailable.to_string());
+        assert_eq!(error.exit_category(), ExitCategory::Failure);
     }
 
     #[test]

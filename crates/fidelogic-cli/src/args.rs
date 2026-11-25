@@ -18,6 +18,10 @@
 //! | `export` | | Vault の内容を書き出す |
 //! | `recover` | | リカバリーコードで解錠し、マスターパスワードを再設定する |
 //!
+//! このほかに、ヘルプに表示しない内部用のサブコマンド `__clipboard-worker` がある。
+//! クリップボードへコピーする処理が自分自身を起動するためのもので、利用者が直接使うものではない。
+//! 詳細は [`crate::sys::clipboard`] を参照する。
+//!
 //! すべてのサブコマンドが `--vault <PATH>` と、パスワードの入力元の指定を受け付ける。
 //! 指定はサブコマンド名の後に置く。
 //! (`fidelogic-cli get --vault ./my.vault github`)。省略したときの既定のパスは、Vault を読み書きする処理で決める。
@@ -50,6 +54,7 @@ use bpaf::{Args, OptionParser, ParseFailure, Parser, construct, long, positional
 use fidelogic_core::active_profile;
 
 use crate::secret_input::PasswordSource;
+use crate::sys::clipboard::{EXCLUDE_FROM_HISTORY_FLAG, HistoryPolicy, WORKER_SUBCOMMAND};
 
 /// 解析に成功した引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +100,13 @@ pub enum Subcommand {
     Export,
     /// `recover`: リカバリーコードで解錠し、マスターパスワードを再設定する。
     Recover,
+    /// `__clipboard-worker`: クリップボードへコピーし、一定時間の後に消去する内部用のワーカー。
+    ///
+    /// ヘルプに表示しない。`--vault` とパスワードの入力元の指定は受け付けない。
+    ClipboardWorker {
+        /// クリップボードの履歴からの除外の扱い。`--exclude-from-history` で除外する。
+        policy: HistoryPolicy,
+    },
 }
 
 impl Subcommand {
@@ -111,6 +123,7 @@ impl Subcommand {
             Self::RotateKey { .. } => "rotate-key",
             Self::Export => "export",
             Self::Recover => "recover",
+            Self::ClipboardWorker { .. } => WORKER_SUBCOMMAND,
         }
     }
 }
@@ -215,13 +228,24 @@ fn parser() -> OptionParser<CommandLine> {
         pure(Subcommand::Recover),
     );
 
+    let clipboard_worker = clipboard_worker();
+
     let version = format!(
         "{} (fidelogic-core: {})",
         env!("CARGO_PKG_VERSION"),
         active_profile()
     );
     construct!([
-        init, unlock, list, get, set, delete, rotate_key, export, recover
+        init,
+        unlock,
+        list,
+        get,
+        set,
+        delete,
+        rotate_key,
+        export,
+        recover,
+        clipboard_worker
     ])
     .to_options()
     .descr("Fidelogic Vault のネイティブ CLI")
@@ -261,6 +285,35 @@ fn subcommand(
         .help_parser(help_flag())
         .command(name)
         .help(description)
+}
+
+/// 内部用のサブコマンド `__clipboard-worker` の解析器を組み立てる。ヘルプには表示しない。
+///
+/// Vault を扱わないため、`--vault` とパスワードの入力元の指定を付けない。
+/// [`CommandLine`] の該当するフィールドは、`None` と制御端末 (未使用) になる。
+fn clipboard_worker() -> impl Parser<CommandLine> {
+    let vault = pure(None);
+    let password_source = pure(PasswordSource::Terminal);
+    let subcommand = long(EXCLUDE_FROM_HISTORY_FLAG)
+        .help("クリップボードの履歴からの除外を指定する")
+        .switch()
+        .map(|exclude| Subcommand::ClipboardWorker {
+            policy: if exclude {
+                HistoryPolicy::Exclude
+            } else {
+                HistoryPolicy::Allow
+            },
+        });
+    construct!(CommandLine {
+        vault,
+        password_source,
+        subcommand
+    })
+    .to_options()
+    .descr("クリップボードへコピーし、一定時間の後に消去する (内部用)")
+    .help_parser(help_flag())
+    .command(WORKER_SUBCOMMAND)
+    .hide()
 }
 
 /// `--help` / `-h` の定義。
@@ -330,6 +383,7 @@ mod tests {
 
     use super::{CommandLine, ParseExit, RotateMode, Subcommand, parse};
     use crate::secret_input::PasswordSource;
+    use crate::sys::clipboard::HistoryPolicy;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -658,6 +712,65 @@ mod tests {
                 "ヘルプに {option} が無い: {subcommand_help}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_clipboard_worker_parses_history_policy() -> TestResult {
+        let plain = parse_strs(&["__clipboard-worker"])?;
+        assert_eq!(
+            plain.subcommand,
+            Subcommand::ClipboardWorker {
+                policy: HistoryPolicy::Allow
+            }
+        );
+        assert_eq!(plain.subcommand.name(), "__clipboard-worker");
+        assert_eq!(plain.vault, None);
+        assert_eq!(plain.password_source, PasswordSource::Terminal);
+
+        let concealed = parse_strs(&["__clipboard-worker", "--exclude-from-history"])?;
+        assert_eq!(
+            concealed.subcommand,
+            Subcommand::ClipboardWorker {
+                policy: HistoryPolicy::Exclude
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_clipboard_worker_rejects_vault_and_secret_options() -> TestResult {
+        let rejected: [&[&str]; 8] = [
+            &["--vault", "./my.vault"],
+            &["--password-stdin"],
+            &["--password-file", "./password.txt"],
+            &["--password-fd", "3"],
+            &["--password", "hunter2"],
+            &["-p", "hunter2"],
+            &["--exclude-from-history", "--exclude-from-history"],
+            &["github"],
+        ];
+        for option in rejected {
+            let args: Vec<&str> = ["__clipboard-worker"]
+                .iter()
+                .chain(option.iter())
+                .copied()
+                .collect();
+            expect_invalid(&args)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_clipboard_worker_is_hidden_from_help() -> TestResult {
+        let help = match parse_strs(&["--help"]) {
+            Err(ParseExit::Help(text)) => text,
+            other => return Err(format!("--help の解析に失敗: {other:?}").into()),
+        };
+        assert!(
+            !help.contains("__clipboard-worker"),
+            "内部用のサブコマンドを非表示にすることの確認に失敗: {help}"
+        );
         Ok(())
     }
 }

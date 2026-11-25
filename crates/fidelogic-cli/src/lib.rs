@@ -9,9 +9,10 @@
 //! コマンドラインから実行するための管理者向けインターフェースを目指している。
 //! 現時点で実装済みなのは、プロセス硬化、引数の解析 ([`args`])、エラー出力と終了コードの規約 ([`error`], [`exit`])、
 //! Vault のパスの正規化・排他ロック・アトミックな保存 ([`sys::storage`])、世代を検証する読み込みと保存 ([`vault_file`])、
-//! パスワードの入力 ([`secret_input`]) である。
+//! パスワードの入力 ([`secret_input`])、クリップボードへのコピーと自動消去 ([`sys::clipboard`]) である。
 //! サブコマンドは解析まで行い、実行すると「未実装」のエラーを返す。
-//! 排他ロック、保存、パスワードの入力を使うサブコマンドはまだ無い。
+//! 排他ロック、保存、パスワードの入力、クリップボードを使うサブコマンドはまだ無い。
+//! 例外は、クリップボードへのコピーが内部で起動する隠しサブコマンド `__clipboard-worker` で、これは実行できる。
 //!
 //! 実行ファイル (`main.rs`) は [`run`] を呼ぶだけの薄い入口であり、処理の本体はこのライブラリに置く。
 //! これにより、統合テストから各処理を直接呼び出せる。
@@ -50,6 +51,9 @@
 //! - **アトミックな保存と世代の二重検証 (実装済み、サブコマンドからは未使用)**: 一時ファイルへの書き込み、永続化、`rename`、
 //!   親ディレクトリの同期の順で保存する ([`sys::storage::write_vault_file_atomically`])。保存の直前にディスク上の Vault を読み直し、
 //!   読み込み時と異なれば中止する ([`vault_file::save_vault`])。
+//! - **クリップボード (実装済み、サブコマンドからは未使用)**: 秘密のコピーは、自分自身を起動したワーカープロセスが行い、
+//!   30 秒後に、内容が変わっていなければ消去する。秘密のフィールドは履歴からの除外を指定する ([`sys::clipboard`])。
+//!   除外の指定を無視するクリップボードマネージャーには防御できない。
 //! - **メモリ保護 (一部実装)**: パスワードの入力バッファは `fidelogic_core` の `LockedBuffer` に置き、
 //!   `mlock` (スワップアウト抑止) に失敗した場合は入力を中止する。
 //!   鍵を保持するバッファへの適用は、鍵を扱う処理とあわせて追加する。
@@ -73,7 +77,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
 
-use crate::args::{CommandLine, ParseExit};
+use crate::args::{CommandLine, ParseExit, Subcommand};
 use crate::error::CliError;
 use crate::exit::ExitCategory;
 
@@ -122,7 +126,7 @@ pub fn run_with_args(
     stderr: &mut impl Write,
 ) -> ExitCategory {
     match args::parse(args) {
-        Ok(command_line) => match execute(&command_line) {
+        Ok(command_line) => match execute(&command_line, stdout) {
             Ok(()) => ExitCategory::Success,
             Err(error) => report_error(stderr, error),
         },
@@ -143,9 +147,15 @@ pub fn run_with_args(
 /// # Errors
 ///
 /// サブコマンドの失敗を [`CliError`] で返す。
-/// 現時点では、すべてのサブコマンドが [`CliError::NotImplemented`] を返す。
-fn execute(command_line: &CommandLine) -> Result<(), CliError> {
-    Err(CliError::NotImplemented(command_line.subcommand.name()))
+/// 現時点では、内部用の `__clipboard-worker` 以外のすべてのサブコマンドが [`CliError::NotImplemented`] を返す。
+fn execute(command_line: &CommandLine, stdout: &mut impl Write) -> Result<(), CliError> {
+    match command_line.subcommand {
+        // 応答は、起動した親とつながる標準出力に書く。
+        Subcommand::ClipboardWorker { policy } => {
+            sys::clipboard::run_worker(policy, stdout).map_err(CliError::from)
+        }
+        _ => Err(CliError::NotImplemented(command_line.subcommand.name())),
+    }
 }
 
 /// エラーを標準エラー出力に書き、終了コードの分類を返す。

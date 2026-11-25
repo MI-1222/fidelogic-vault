@@ -10,6 +10,7 @@ fidelogic-core = { workspace = true, features = ["std", "profile-vault", "memloc
 libc = { workspace = true }
 bpaf = { version = "0.9", default-features = false }
 tempfile = { version = "3.27", default-features = false }
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
 [lints.clippy]
 unwrap_used = "deny"
