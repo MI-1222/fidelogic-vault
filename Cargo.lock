@@ -406,6 +406,7 @@ dependencies = [
  "arboard",
  "bpaf",
  "fidelogic-core",
+ "getrandom",
  "libc",
  "tempfile",
 ]

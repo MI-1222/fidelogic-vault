@@ -25,6 +25,7 @@
 //! | [`signal`] | 中断シグナルの捕捉と、入力と中断の待機 | 実装済み |
 //! | [`tty`] | 端末と非対話の入力元からの読み込み (エコーの抑止、端末属性の復元) | 実装済み |
 //! | [`clipboard`] | クリップボードへのコピーと自動消去 (ワーカープロセスの起動を含む) | 実装済み |
+//! | [`random`] | OS の暗号論的に安全な乱数の取得 | 実装済み |
 //!
 //! ## 対応環境
 //!
@@ -35,6 +36,7 @@ compile_error!("fidelogic-cli は POSIX 環境 (macOS / Linux) のみに対応�
 
 pub mod clipboard;
 pub mod process;
+pub mod random;
 pub mod signal;
 pub mod storage;
 pub mod tty;

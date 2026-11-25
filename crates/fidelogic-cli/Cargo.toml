@@ -11,6 +11,7 @@ libc = { workspace = true }
 bpaf = { version = "0.9", default-features = false }
 tempfile = { version = "3.27", default-features = false }
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+getrandom = { version = "0.4", default-features = false }
 
 [lints.clippy]
 unwrap_used = "deny"
