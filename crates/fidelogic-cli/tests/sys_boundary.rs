@@ -43,7 +43,7 @@ const TARGET_CFG_NAMES: &[&str] = &[
 
 /// `sys` の中で `unsafe` を許す実装モジュール (`src/sys` からの相対パス)。
 /// OS の API を直接呼び出すモジュールを実装するときに、レビューを経てここへ加える。
-const UNSAFE_ALLOWED_FILES: &[&str] = &["process.rs", "storage.rs"];
+const UNSAFE_ALLOWED_FILES: &[&str] = &["process.rs", "signal.rs", "storage.rs", "tty.rs"];
 
 /// 字句解析で得た要素。
 #[derive(Debug, PartialEq, Eq)]

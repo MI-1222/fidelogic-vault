@@ -18,16 +18,28 @@
 //! | `export` | | Vault の内容を書き出す |
 //! | `recover` | | リカバリーコードで解錠し、マスターパスワードを再設定する |
 //!
-//! すべてのサブコマンドが `--vault <PATH>` を受け付ける。
+//! すべてのサブコマンドが `--vault <PATH>` と、パスワードの入力元の指定を受け付ける。
 //! 指定はサブコマンド名の後に置く。
 //! (`fidelogic-cli get --vault ./my.vault github`)。省略したときの既定のパスは、Vault を読み書きする処理で決める。
+//!
+//! ## パスワードの入力元
+//!
+//! | 指定 | 入力元 |
+//! | :-- | :-- |
+//! | (指定なし) | 制御端末 |
+//! | `--password-stdin` | 標準入力 |
+//! | `--password-file <PATH>` | ファイル (グループと他者の権限が無いこと) |
+//! | `--password-fd <FD>` | 引き継いだファイル記述子 |
+//!
+//! 3 つの指定は同時に使えない。`unlock` は標準入力をコマンドの入力に使うため、
+//! `--password-stdin` と `--password-fd 0` を拒否する。読み込みは [`crate::secret_input`] が行う。
 //!
 //! ## 秘密を引数と環境変数で受け取らない
 //!
 //! パスワード、リカバリーコード、エントリの秘密のフィールドを値として受け取る引数は設けない。
 //! 引数はプロセス一覧 (`ps`) やシェルの履歴から、環境変数は `/proc/<pid>/environ` や子プロセスへの継承から漏れるためである。
 //! `bpaf` の、環境変数から既定値を読む機能 (`NamedArg` の `env`) も使わない。
-//! 秘密は端末から読み込む ([`crate::sys::tty`])。
+//! 秘密は、端末か、上の指定が示す入力元から読み込む。引数で指定するのは入力元だけである。
 
 use std::ffi::OsString;
 use std::fmt;
@@ -37,11 +49,15 @@ use bpaf::parsers::NamedArg;
 use bpaf::{Args, OptionParser, ParseFailure, Parser, construct, long, positional, pure, short};
 use fidelogic_core::active_profile;
 
+use crate::secret_input::PasswordSource;
+
 /// 解析に成功した引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandLine {
     /// `--vault` で指定された Vault ファイルのパス。省略時は `None`。
     pub vault: Option<PathBuf>,
+    /// マスターパスワードの入力元。指定が無ければ制御端末。
+    pub password_source: PasswordSource,
     /// 実行するサブコマンド。
     pub subcommand: Subcommand,
 }
@@ -214,16 +230,33 @@ fn parser() -> OptionParser<CommandLine> {
     .version_parser(short('V').long("version").help("バージョンを表示する"))
 }
 
-/// サブコマンドの解析器を組み立てる。すべてのサブコマンドに `--vault` を付ける。
+/// 標準入力をコマンドの入力に使うサブコマンドが、パスワードの入力元に標準入力を指定していないかを判定する。
+///
+/// `unlock` は、対話モードのコマンドを標準入力から読み込む。
+fn does_not_share_standard_input(command_line: &CommandLine) -> bool {
+    !(command_line.subcommand == Subcommand::Unlock
+        && command_line.password_source.reads_standard_input())
+}
+
+/// サブコマンドの解析器を組み立てる。すべてのサブコマンドに、`--vault` とパスワードの入力元の指定を付ける。
 fn subcommand(
     name: &'static str,
     description: &'static str,
     arguments: impl Parser<Subcommand> + 'static,
 ) -> impl Parser<CommandLine> {
     let vault = vault_option();
+    let password_source = password_source_options();
     let subcommand = arguments;
-    construct!(CommandLine { vault, subcommand })
-        .to_options()
+    construct!(CommandLine {
+        vault,
+        password_source,
+        subcommand
+    })
+    .guard(
+        does_not_share_standard_input,
+        "`unlock` は標準入力をコマンドの入力に使うため、パスワードの入力元に標準入力を指定できません。",
+    )
+    .to_options()
         .descr(description)
         .help_parser(help_flag())
         .command(name)
@@ -241,6 +274,29 @@ fn vault_option() -> impl Parser<Option<PathBuf>> {
         .help("Vault ファイルのパス")
         .argument::<PathBuf>("PATH")
         .optional()
+}
+
+/// マスターパスワードの入力元の指定。
+///
+/// `--password-stdin`, `--password-file`, `--password-fd` は同時に指定できない。
+/// どれも無い場合は、制御端末から読み込む。
+fn password_source_options() -> impl Parser<PasswordSource> {
+    let standard_input = long("password-stdin")
+        .help("マスターパスワードを標準入力から読み込む")
+        .req_flag(PasswordSource::StandardInput);
+    let file = long("password-file")
+        .help("マスターパスワードをファイル (権限 0600) から読み込む")
+        .argument::<PathBuf>("PATH")
+        .map(PasswordSource::File);
+    let descriptor = long("password-fd")
+        .help("マスターパスワードを、引き継いだファイル記述子から読み込む")
+        .argument::<i32>("FD")
+        .guard(
+            |descriptor| *descriptor >= 0,
+            "ファイル記述子は 0 以上の整数で指定してください。",
+        )
+        .map(PasswordSource::Descriptor);
+    construct!([standard_input, file, descriptor]).fallback(PasswordSource::Terminal)
 }
 
 /// `get` / `set` / `delete` が受け取る対象のエントリ。
@@ -273,6 +329,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{CommandLine, ParseExit, RotateMode, Subcommand, parse};
+    use crate::secret_input::PasswordSource;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -466,6 +523,108 @@ mod tests {
         Ok(())
     }
 
+    /// 入力元の指定と、解析結果の組。
+    fn password_source_cases() -> [(&'static [&'static str], PasswordSource); 6] {
+        [
+            (&["--password-stdin"], PasswordSource::StandardInput),
+            (
+                &["--password-file", "./password.txt"],
+                PasswordSource::File(PathBuf::from("./password.txt")),
+            ),
+            (
+                &["--password-file=./password.txt"],
+                PasswordSource::File(PathBuf::from("./password.txt")),
+            ),
+            (&["--password-fd", "3"], PasswordSource::Descriptor(3)),
+            (&["--password-fd=0"], PasswordSource::Descriptor(0)),
+            (&["--password-fd", "1023"], PasswordSource::Descriptor(1023)),
+        ]
+    }
+
+    #[test]
+    fn test_password_source_defaults_to_terminal() -> TestResult {
+        for args in MINIMAL_INVOCATIONS {
+            assert_eq!(
+                parse_strs(args)?.password_source,
+                PasswordSource::Terminal,
+                "{args:?} の既定の入力元の確認に失敗。"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_password_source_options_are_accepted() -> TestResult {
+        for invocation in MINIMAL_INVOCATIONS {
+            for (option, expected) in password_source_cases() {
+                let args: Vec<&str> = invocation.iter().chain(option.iter()).copied().collect();
+                // `unlock` は標準入力をコマンドの入力に使うため、標準入力からの指定を別に検査する。
+                if invocation == ["unlock"] && expected.reads_standard_input() {
+                    continue;
+                }
+                let command_line =
+                    parse_strs(&args).map_err(|exit| format!("{args:?}: {exit:?}"))?;
+                assert_eq!(
+                    command_line.password_source, expected,
+                    "{args:?} の入力元の解析に失敗。"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_unlock_rejects_password_from_standard_input() -> TestResult {
+        for option in [
+            &["--password-stdin"][..],
+            &["--password-fd", "0"],
+            &["--password-fd=0"],
+        ] {
+            let args: Vec<&str> = ["unlock"].iter().chain(option.iter()).copied().collect();
+            let message = expect_invalid(&args)?;
+            assert!(
+                message.contains("標準入力"),
+                "{args:?} の理由の表示の確認に失敗: {message}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_password_source_options_are_exclusive() -> TestResult {
+        let conflicts: [&[&str]; 6] = [
+            &["list", "--password-stdin", "--password-file", "a"],
+            &["list", "--password-stdin", "--password-fd", "3"],
+            &["list", "--password-file", "a", "--password-fd", "3"],
+            &["list", "--password-stdin", "--password-stdin"],
+            &["list", "--password-file", "a", "--password-file", "b"],
+            &["list", "--password-fd", "3", "--password-fd", "4"],
+        ];
+        for args in conflicts {
+            expect_invalid(args)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_password_source_values_are_rejected() -> TestResult {
+        // 値の誤りは、既定の入力元 (端末) に置き換えずに拒否する。
+        let invalid: [&[&str]; 8] = [
+            &["list", "--password-file"],
+            &["list", "--password-fd"],
+            &["list", "--password-fd", "abc"],
+            &["list", "--password-fd="],
+            &["list", "--password-fd=-1"],
+            &["list", "--password-fd", "2147483648"],
+            &["list", "--password-stdin=value"],
+            &["--password-stdin", "list"],
+        ];
+        for args in invalid {
+            expect_invalid(args)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_help_and_version_are_printed_to_stdout() -> TestResult {
         let help = match parse_strs(&["--help"]) {
@@ -493,6 +652,12 @@ mod tests {
         };
         assert!(subcommand_help.contains("--full-dek"));
         assert!(subcommand_help.contains("--vault"));
+        for option in ["--password-stdin", "--password-file", "--password-fd"] {
+            assert!(
+                subcommand_help.contains(option),
+                "ヘルプに {option} が無い: {subcommand_help}"
+            );
+        }
         Ok(())
     }
 }

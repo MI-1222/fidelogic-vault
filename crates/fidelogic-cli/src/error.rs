@@ -17,6 +17,7 @@ use core::fmt;
 use fidelogic_core::VaultError;
 
 use crate::exit::ExitCategory;
+use crate::secret_input::SecretInputError;
 use crate::sys::process::HardeningError;
 
 /// 認証の失敗を表すメッセージ。失敗の理由によらず、この文言だけを表示する。
@@ -38,6 +39,8 @@ pub enum CliError {
     RollbackDetected,
     /// エンジンの状態遷移が不正である (内部の誤り)。
     InvalidState,
+    /// パスワードの入力に失敗した。中断を含む。
+    SecretInput(SecretInputError),
     /// 標準出力への書き込みに失敗した。
     OutputFailed,
 }
@@ -75,12 +78,15 @@ impl CliError {
     ///
     /// # Returns
     ///
-    /// `AuthenticationFailed` は [`ExitCategory::AuthenticationFailed`]、それ以外は [`ExitCategory::Failure`]。
+    /// `AuthenticationFailed` は [`ExitCategory::AuthenticationFailed`]、
+    /// 入力の中断は [`ExitCategory::Interrupted`]、それ以外は [`ExitCategory::Failure`]。
     #[must_use]
     pub const fn exit_category(self) -> ExitCategory {
         match self {
             Self::AuthenticationFailed => ExitCategory::AuthenticationFailed,
-            Self::Hardening(_)
+            Self::SecretInput(SecretInputError::Interrupted) => ExitCategory::Interrupted,
+            Self::SecretInput(_)
+            | Self::Hardening(_)
             | Self::NotImplemented(_)
             | Self::RollbackDetected
             | Self::InvalidState
@@ -92,6 +98,12 @@ impl CliError {
 impl From<HardeningError> for CliError {
     fn from(error: HardeningError) -> Self {
         Self::Hardening(error)
+    }
+}
+
+impl From<SecretInputError> for CliError {
+    fn from(error: SecretInputError) -> Self {
+        Self::SecretInput(error)
     }
 }
 
@@ -109,6 +121,7 @@ impl fmt::Display for CliError {
             Self::RollbackDetected => formatter
                 .write_str("Vault の世代が以前に読み込んだものより古いため、処理を中止しました。"),
             Self::InvalidState => formatter.write_str("内部状態が不正なため、処理を中止しました。"),
+            Self::SecretInput(error) => write!(formatter, "{error}"),
             Self::OutputFailed => formatter.write_str("標準出力への書き込みに失敗しました。"),
         }
     }
@@ -120,6 +133,7 @@ mod tests {
 
     use super::{AUTHENTICATION_FAILED_MESSAGE, CliError};
     use crate::exit::ExitCategory;
+    use crate::secret_input::SecretInputError;
     use crate::sys::process::{HardeningError, HardeningStep};
 
     /// 認証の失敗にまとめるべき `VaultError` の全バリアント。
@@ -199,6 +213,29 @@ mod tests {
     }
 
     #[test]
+    fn test_only_interrupted_input_uses_interrupted_exit_code() {
+        let interrupted = CliError::from(SecretInputError::Interrupted);
+        assert_eq!(interrupted.exit_category(), ExitCategory::Interrupted);
+        assert_eq!(
+            interrupted.to_string(),
+            SecretInputError::Interrupted.to_string()
+        );
+        for error in [
+            SecretInputError::Empty,
+            SecretInputError::TooLong,
+            SecretInputError::MultipleLines,
+            SecretInputError::EndOfInput,
+            SecretInputError::MemoryLockFailed,
+        ] {
+            assert_eq!(
+                CliError::from(error).exit_category(),
+                ExitCategory::Failure,
+                "{error:?} の終了コードの分類に失敗。"
+            );
+        }
+    }
+
+    #[test]
     fn test_messages_end_with_japanese_period() {
         let errors = [
             CliError::Hardening(HardeningError::Os {
@@ -209,6 +246,7 @@ mod tests {
             CliError::AuthenticationFailed,
             CliError::RollbackDetected,
             CliError::InvalidState,
+            CliError::SecretInput(SecretInputError::Interrupted),
             CliError::OutputFailed,
         ];
         for error in errors {

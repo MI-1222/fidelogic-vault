@@ -22,7 +22,8 @@
 //! | :-- | :-- | :-- |
 //! | [`process`] | プロセス硬化 (コアダンプの抑止、`umask`、ダンプとデバッガーのアタッチの拒否) | 実装済み |
 //! | [`storage`] | Vault ファイルの排他ロック、読み込み、アトミックな保存 | 実装済み |
-//! | [`tty`] | 端末からの秘密の入力 (エコーの抑止、中断時の端末属性の復元) | 未実装 |
+//! | [`signal`] | 中断シグナルの捕捉と、入力と中断の待機 | 実装済み |
+//! | [`tty`] | 端末と非対話の入力元からの読み込み (エコーの抑止、端末属性の復元) | 実装済み |
 //! | [`clipboard`] | クリップボードへのコピーと自動消去 | 未実装 |
 //!
 //! ## 対応環境
@@ -34,5 +35,6 @@ compile_error!("fidelogic-cli は POSIX 環境 (macOS / Linux) のみに対応�
 
 pub mod clipboard;
 pub mod process;
+pub mod signal;
 pub mod storage;
 pub mod tty;
