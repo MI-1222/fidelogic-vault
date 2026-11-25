@@ -320,7 +320,7 @@ fn open_entries_inner(
 
     let mut seen = BTreeSet::new();
     let mut opened = Vec::with_capacity(manifest.len() / MANIFEST_ITEM_LEN);
-    for item in manifest.as_slice().chunks_exact(MANIFEST_ITEM_LEN) {
+    for item in manifest.as_slice().as_chunks::<MANIFEST_ITEM_LEN>().0 {
         let (id_bytes, total_bytes) = item.split_at(ENTRY_ID_LEN);
         let entry_id: EntryId = id_bytes.try_into().map_err(|_| invalid_parameter())?;
         let total = u16::from_be_bytes(total_bytes.try_into().map_err(|_| invalid_parameter())?);
