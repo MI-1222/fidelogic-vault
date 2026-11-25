@@ -50,6 +50,7 @@ use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -248,8 +249,8 @@ impl WorkerStatus {
 ///
 /// - 呼び出す前に、鍵 (DEK) と、コピーする内容以外の秘密を消去しておくこと。
 ///   ワーカーの起動と応答を待つ間に、親のメモリに不要な秘密を残さないためである。
-/// - 戻った後もワーカーは動き続ける。親が終了するまでワーカーを回収しないため、
-///   長く動く親 (対話モード) では、ワーカーの終了後に回収されない子プロセス (ゾンビ) が残る。
+/// - 戻った後もワーカーは動き続ける。この関数はワーカーを回収しないため、
+///   長く動く親 (対話モード) は、[`reap_finished_workers`] を呼んで終了したワーカーを回収する。
 /// - 実行ファイルが起動後に置き換えられていた場合は、置き換え後のファイルを起動する。
 pub fn copy_with_auto_clear(text: &str, policy: HistoryPolicy) -> Result<(), ClipboardError> {
     let program = std::env::current_exe()
@@ -292,8 +293,29 @@ pub fn copy_via_worker(
     if status.is_err() {
         // コピーに失敗したワーカーは直ちに終了する。回収して、子プロセスを残さない。
         let _ = child.wait();
+    } else {
+        // 消去まで動き続けるワーカーは、終了した後に `reap_finished_workers` で回収する。
+        running_workers().push(child);
     }
     status
+}
+
+/// コピーに成功し、まだ回収していないワーカー。
+static RUNNING_WORKERS: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+fn running_workers() -> MutexGuard<'static, Vec<Child>> {
+    // 一覧への追加と削除の途中で中断する状態は無いため、ポイズンされていても使える。
+    RUNNING_WORKERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 終了したワーカーを回収する。実行中のワーカーは待たずに残す。
+///
+/// 長く動く親 (対話モード) が、回収されない子プロセス (ゾンビ) を残さないために呼ぶ。
+pub fn reap_finished_workers() {
+    // 状態を確認できないワーカーは、回収の対象から外す。
+    running_workers().retain_mut(|worker| matches!(worker.try_wait(), Ok(None)));
 }
 
 /// ワーカーを起動するコマンドを組み立てる。

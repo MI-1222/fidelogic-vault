@@ -37,12 +37,12 @@ use fidelogic_core::SlotCredential;
 
 use crate::args::RotateMode;
 use crate::error::CliError;
-use crate::interaction::{read_canonical_password, read_new_password};
+use crate::interaction::{ask_consent, read_canonical_password, read_new_password};
 use crate::key_update::{
     UnlockedVault, UpdateKind, UpdateTarget, report_new_recovery_code, update_and_save,
 };
 use crate::rekey::has_prf_slot;
-use crate::secret_input::{PasswordSource, SecretInputError, read_password};
+use crate::secret_input::PasswordSource;
 use crate::sys::signal::InterruptWatcher;
 
 /// 端末から現在のマスターパスワードを読み込むときのプロンプト。
@@ -143,19 +143,11 @@ fn confirm_prf_removal(
     if *password_source != PasswordSource::Terminal {
         return Err(CliError::PrfSlotRequiresDrop);
     }
-    match read_password(&PasswordSource::Terminal, PRF_REMOVAL_PROMPT, watcher) {
-        Ok(answer) if is_consent(answer.as_bytes()) => Ok(()),
-        Ok(_)
-        | Err(SecretInputError::Empty | SecretInputError::TooLong | SecretInputError::EndOfInput) => {
-            Err(CliError::PrfSlotDropDeclined)
-        }
-        Err(error) => Err(error.into()),
+    if ask_consent(PRF_REMOVAL_PROMPT, watcher)? {
+        Ok(())
+    } else {
+        Err(CliError::PrfSlotDropDeclined)
     }
-}
-
-/// 応答が同意 (`y` または `yes`。大文字と小文字を区別しない) かを返す。応答は秘密ではない。
-fn is_consent(answer: &[u8]) -> bool {
-    answer.eq_ignore_ascii_case(b"y") || answer.eq_ignore_ascii_case(b"yes")
 }
 
 /// 更新の結果を書く。
@@ -178,28 +170,4 @@ fn report(
         report_new_recovery_code(stdout, kit_html)?;
     }
     stdout.flush()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_consent;
-
-    #[test]
-    fn test_consent_accepts_only_yes() {
-        for answer in [&b"y"[..], b"Y", b"yes", b"YES", b"Yes"] {
-            assert!(is_consent(answer), "{answer:?} の受理に失敗。");
-        }
-        for answer in [
-            &b""[..],
-            b"n",
-            b"no",
-            b"yy",
-            b"ye",
-            b" y",
-            b"y ",
-            "ｙ".as_bytes(),
-        ] {
-            assert!(!is_consent(answer), "{answer:?} の拒否に失敗。");
-        }
-    }
 }

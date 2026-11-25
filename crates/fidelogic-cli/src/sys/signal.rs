@@ -31,6 +31,11 @@
 //! `SA_RESTART` を指定しないため、シグナルを処理したスレッドのシステムコールの待機は `EINTR` で中断される。
 //! 別のスレッドが処理した場合は中断されないため、中断に対応する入出力は、非ブロッキングの記述子と `select` で待つ。
 //!
+//! ## 無操作の上限
+//!
+//! [`InterruptWatcher::set_idle_limit`] で、1 回の待機に上限の時間を設けられる。対話モードが、
+//! 入力を待ち続けて鍵を保持しないために使う。上限がある間は、`select` を最長 1 秒で戻して経過を確かめる。
+//!
 //! ## OS ごとの差
 //!
 //! | 処理 | POSIX | Windows (未対応) |
@@ -40,11 +45,13 @@
 
 #![allow(unsafe_code)]
 
+use core::cell::Cell;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 /// 中断として扱うシグナル。
 const WATCHED_SIGNALS: [libc::c_int; 4] =
@@ -124,6 +131,60 @@ pub(super) enum Wakeup {
     Ready,
     /// 中断のシグナルを受けた。
     Interrupted,
+    /// 待機の時間が、設定した上限に達した。
+    TimedOut,
+}
+
+/// 無操作の時間が上限に達したかを判定する。
+///
+/// 単調時計は、スリープ中に進まない OS がある。壁時計の経過も合わせて見て、スリープの時間を数える。
+/// 壁時計が戻って経過を求められない (`None`) 場合は、単調時計だけで判定する。
+fn idle_expired(monotonic: Duration, wall: Option<Duration>, limit: Duration) -> bool {
+    monotonic >= limit || wall.is_some_and(|wall| wall >= limit)
+}
+
+/// 待機の上限がある場合に、`select` を戻して経過を確かめる間隔。
+///
+/// スリープからの復帰後など、`select` の期限より先に壁時計が上限に達した場合に、遅れを抑える。
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 1 回の待機の経過を測る。
+#[derive(Debug, Clone, Copy)]
+struct IdleTimer {
+    monotonic: Instant,
+    wall: SystemTime,
+    limit: Duration,
+}
+
+impl IdleTimer {
+    fn start(limit: Duration) -> Self {
+        Self {
+            monotonic: Instant::now(),
+            wall: SystemTime::now(),
+            limit,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        idle_expired(
+            self.monotonic.elapsed(),
+            self.wall.elapsed().ok(),
+            self.limit,
+        )
+    }
+
+    /// 次の `select` に渡す時間。上限までの残りと、確認の間隔の短い方にする。
+    fn next_slice(&self) -> libc::timeval {
+        let slice = self
+            .limit
+            .saturating_sub(self.monotonic.elapsed())
+            .min(IDLE_CHECK_INTERVAL);
+        // 間隔は 1 秒以下のため、どちらの値も変換先の型に収まる。
+        libc::timeval {
+            tv_sec: slice.as_secs() as _,
+            tv_usec: slice.subsec_micros() as _,
+        }
+    }
 }
 
 /// 中断のシグナルを捕捉している間だけ存在する値。
@@ -135,6 +196,8 @@ pub struct InterruptWatcher {
     wake_reader: RawFd,
     /// 置き換える前の設定。置き換えていないシグナルは `None`。
     previous: [Option<libc::sigaction>; WATCHED_SIGNALS.len()],
+    /// 1 回の待機の上限。`None` は上限なし。
+    idle_limit: Cell<Option<Duration>>,
 }
 
 impl fmt::Debug for InterruptWatcher {
@@ -164,6 +227,7 @@ impl InterruptWatcher {
         let mut watcher = Self {
             wake_reader: -1,
             previous: [None; WATCHED_SIGNALS.len()],
+            idle_limit: Cell::new(None),
         };
         let pipe = wake_pipe()?;
         watcher.wake_reader = pipe.reader;
@@ -182,9 +246,19 @@ impl InterruptWatcher {
         INTERRUPTED.load(Ordering::SeqCst)
     }
 
-    /// `descriptor` が `interest` の状態になるか、中断のシグナルを受けるまで待つ。
+    /// 端末と入力元の 1 回の待機に、上限の時間を設ける。`None` で上限を外す。
+    ///
+    /// 上限は待機ごとに測り直すため、入力や出力が進むたびに延びる。無操作の時間の上限として使う。
+    /// 上限に達した読み書きは、[`crate::sys::tty::TtyError::IdleTimeout`] になる。
+    /// 時間は単調時計と壁時計の両方で測り、スリープしていた時間も数える。
+    pub fn set_idle_limit(&self, limit: Option<Duration>) {
+        self.idle_limit.set(limit);
+    }
+
+    /// `descriptor` が `interest` の状態になるか、中断のシグナルを受けるか、待機の上限に達するまで待つ。
     ///
     /// 中断を先に確認するため、両方が成立している場合は [`Wakeup::Interrupted`] を返す。
+    /// 上限に達した後に記述子が待っていた状態になった場合は、[`Wakeup::TimedOut`] を返す。
     ///
     /// # Errors
     ///
@@ -194,10 +268,19 @@ impl InterruptWatcher {
         if !is_selectable(descriptor) || !is_selectable(self.wake_reader) {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
+        let timer = self.idle_limit.get().map(IdleTimer::start);
+        let is_expired = || timer.is_some_and(|timer| timer.is_expired());
         loop {
             if self.is_interrupted() {
                 return Ok(Wakeup::Interrupted);
             }
+            if is_expired() {
+                return Ok(Wakeup::TimedOut);
+            }
+            let mut slice = timer.map(|timer| timer.next_slice());
+            let timeout = slice
+                .as_mut()
+                .map_or(core::ptr::null_mut(), core::ptr::from_mut);
             // SAFETY: `fd_set` は整数の配列だけを持ち、全ビット 0 は有効な値である。
             let mut readable: libc::fd_set = unsafe { core::mem::zeroed() };
             // SAFETY: 同上。
@@ -216,14 +299,15 @@ impl InterruptWatcher {
             // 起床用の記述子も、`FD_SETSIZE` 未満であることを確認している。
             unsafe { libc::FD_SET(self.wake_reader, &mut readable) };
             let limit = descriptor.max(self.wake_reader) + 1;
-            // SAFETY: 2 つの集合は呼び出しの間生存し、例外の集合とタイムアウトには null を渡す。
+            // SAFETY: 2 つの集合は呼び出しの間生存し、例外の集合には null を渡す。
+            // タイムアウトは null か、呼び出しの間生存する `slice` を指す。
             let ready = unsafe {
                 libc::select(
                     limit,
                     &mut readable,
                     &mut writable,
                     core::ptr::null_mut(),
-                    core::ptr::null_mut(),
+                    timeout,
                 )
             };
             if ready < 0 {
@@ -235,6 +319,9 @@ impl InterruptWatcher {
             }
             if self.is_interrupted() {
                 return Ok(Wakeup::Interrupted);
+            }
+            if is_expired() {
+                return Ok(Wakeup::TimedOut);
             }
             // SAFETY: `readable` は `select` が更新した有効な集合で、記述子は範囲内である。
             if unsafe { libc::FD_ISSET(self.wake_reader, &readable) } {
@@ -391,6 +478,38 @@ fn drain(reader: RawFd) {
         let read = unsafe { libc::read(reader, sink.as_mut_ptr().cast(), sink.len()) };
         if read <= 0 {
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::idle_expired;
+
+    #[test]
+    fn test_idle_expires_when_either_clock_reaches_the_limit() {
+        let limit = Duration::from_secs(300);
+        let before = limit - Duration::from_nanos(1);
+        let after = limit + Duration::from_secs(1);
+        let zero = Duration::ZERO;
+        let cases = [
+            ("どちらも手前", before, Some(before), false),
+            ("経過なし", zero, Some(zero), false),
+            ("単調時計がちょうど", limit, Some(zero), true),
+            ("単調時計が超過", after, Some(zero), true),
+            ("壁時計がちょうど", zero, Some(limit), true),
+            ("壁時計が超過 (スリープ)", zero, Some(after), true),
+            ("壁時計が戻り、単調時計が手前", before, None, false),
+            ("壁時計が戻り、単調時計がちょうど", limit, None, true),
+        ];
+        for (name, monotonic, wall, expected) in cases {
+            assert_eq!(
+                idle_expired(monotonic, wall, limit),
+                expected,
+                "{name}の判定に失敗。"
+            );
         }
     }
 }

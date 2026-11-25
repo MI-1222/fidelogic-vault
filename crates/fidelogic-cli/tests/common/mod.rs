@@ -18,10 +18,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fidelogic_core::{Vault, deserialize};
 
+pub mod entry_vault;
 pub mod fixture;
 
 pub type TestResult = Result<(), Box<dyn Error>>;
@@ -50,6 +52,13 @@ read -r release < /dev/tty
 /// [`SHELL_SCRIPT`] と同じ処理で、記述子 3 を [`DESCRIPTOR_SOURCE`] のファイルにして実行ファイルを起動する。
 pub const DESCRIPTOR_SCRIPT: &str = r#"trap ':' INT QUIT TERM HUP
 "$0" "$@" 3<"$FIDELOGIC_CLI_INIT_DESCRIPTOR_SOURCE"
+printf 'STATUS %s\n' "$?"
+read -r release < /dev/tty
+"#;
+
+/// [`SHELL_SCRIPT`] と同じ処理で、実行ファイルの標準入出力をすべて制御端末にする。
+pub const TERMINAL_SCRIPT: &str = r#"trap ':' INT QUIT TERM HUP
+"$0" "$@" </dev/tty >/dev/tty 2>/dev/tty
 printf 'STATUS %s\n' "$?"
 read -r release < /dev/tty
 "#;
@@ -265,6 +274,8 @@ pub enum Redirect<'a> {
     BrokenStdout,
     /// 記述子 3 を、指定したファイルの読み込みにする。
     DescriptorThreeFrom(&'a Path),
+    /// 標準入力、標準出力、標準エラー出力を、制御端末にする。
+    Terminal,
 }
 
 /// `RLIMIT_MEMLOCK` のソフトとハードの上限を `limit` にする。`fork` 後の子プロセスで呼べる。
@@ -278,6 +289,17 @@ pub fn set_memory_lock_limit(limit: libc::rlim_t) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// 子の起動と、後から `FD_CLOEXEC` を付ける記述子の作成を、並行するテストの間で直列化する。
+///
+/// macOS には `pipe2` が無く、パイプの作成と `FD_CLOEXEC` の設定の間に別のスレッドが子を起動すると、
+/// 記述子が引き継がれる。引き継がれると、読み手を閉じたパイプへの書き込みが失敗せず、
+/// 入力を閉じても終端が届かない。
+pub fn spawn_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    // 保護する状態は無いため、他のテストが失敗していても使える。
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// 疑似端末で実行ファイルを動かしているシェル。破棄時に、プロセスグループごと強制終了する。
@@ -299,6 +321,7 @@ pub struct Outcome {
 
 impl Session {
     pub fn spawn(args: &[&str], options: &Options<'_>) -> Result<Self, Box<dyn Error>> {
+        let guard = spawn_lock();
         let pty = Pty::open()?;
         let initial = attributes(pty.slave.as_raw_fd())?;
         let slave = pty.slave.as_raw_fd();
@@ -307,6 +330,7 @@ impl Session {
             Redirect::None => SHELL_SCRIPT,
             Redirect::BrokenStdout => BROKEN_STDOUT_SCRIPT,
             Redirect::DescriptorThreeFrom(_) => DESCRIPTOR_SCRIPT,
+            Redirect::Terminal => TERMINAL_SCRIPT,
         };
         let mut command = Command::new("/bin/sh");
         command
@@ -339,6 +363,7 @@ impl Session {
             command.current_dir(directory);
         }
         let mut shell = command.spawn()?;
+        drop(guard);
         let mut stdin = shell.stdin.take().ok_or("子の標準入力がありません。")?;
         if let Some(contents) = options.stdin {
             stdin.write_all(contents)?;

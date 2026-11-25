@@ -4,20 +4,22 @@
 //!
 //! ## Overview
 //!
-//! 本ツールは、ファイルシステム上に永続化された暗号化ストレージ (Vault) の作成、スロット構成の更新
-//! (Argon2id パスワード、WebAuthn PRF 鍵、リカバリーコード)、機密エントリの安全な格納・抽出を
-//! コマンドラインから実行するための管理者向けインターフェースを目指している。
-//! 実行できるサブコマンドは次のとおりである。
+//! ファイルシステム上に永続化された暗号化ストレージ (Vault) の作成、スロット構成の更新 (Argon2id パスワード、
+//! リカバリーコード)、機密エントリの格納と取り出しを、コマンドラインから実行する。
+//! WebAuthn PRF のスロットは保持と破棄だけを行い、登録と解錠はできない。
 //!
-//! - `init`: Vault を作成してリカバリーキットを表示する ([`init`])。
-//! - `recover`: リカバリーコードで解錠し、マスターパスワードを再設定する ([`recover`])。
-//! - `rotate-key`: スロットの鍵、または DEK を更新する ([`rotate_key`])。
-//! - `__clipboard-worker`: クリップボードへのコピーが内部で起動する隠しサブコマンド。
-//!
-//! 他のサブコマンドは解析まで行い、実行すると「未実装」のエラーを返す。
-//!
-//! エントリの操作に使う部品のうち、クリップボードへのコピーと自動消去 ([`sys::clipboard`]) は実装済みだが、
-//! 呼び出すサブコマンドはまだ無い。
+//! | サブコマンド | 内容 | モジュール |
+//! | :-- | :-- | :-- |
+//! | `init` | Vault を作成してリカバリーキットを表示する | [`init`] |
+//! | `unlock` | 解錠して、対話モードでエントリを操作する | [`unlock`] |
+//! | `list` | エントリの一覧を表示する | [`list`] |
+//! | `get` | エントリの表示、項目の出力、クリップボードへのコピー | [`get`] |
+//! | `set` | エントリの追加と更新 | [`set`] |
+//! | `delete` | エントリの削除 | [`delete`] |
+//! | `export` | 全エントリを平文の JSON で書き出す | [`export`] |
+//! | `recover` | リカバリーコードで解錠し、マスターパスワードを再設定する | [`recover`] |
+//! | `rotate-key` | スロットの鍵、または DEK を更新する | [`rotate_key`] |
+//! | `__clipboard-worker` | クリップボードへのコピーが内部で起動する隠しサブコマンド | [`sys::clipboard`] |
 //!
 //! 実行ファイル (`main.rs`) は [`run`] を呼ぶだけの薄い入口であり、処理の本体はこのライブラリに置く。
 //! これにより、統合テストから各処理を直接呼び出せる。
@@ -56,20 +58,24 @@
 //!   ([`sys::storage::VaultLock`])。ロックを取得しないプログラムによる読み書きは防げない。
 //! - **アトミックな作成と保存 (実装済み)**: 一時ファイルへの書き込み、永続化、改名、親ディレクトリの同期の順で書く。
 //!   `init` は、既存のファイルを置き換えない改名で作成する ([`sys::storage::create_vault_file_atomically`])。
-//! - **世代の二重検証 (実装済み)**: `recover` と `rotate-key` は、保存の直前にディスク上の Vault を読み直し、
-//!   読み込み時と異なれば中止する ([`vault_file::save_vault`])。
+//! - **世代の二重検証 (実装済み)**: Vault を保存するサブコマンドは、保存の直前にディスク上の Vault を読み直し、
+//!   読み込み時と異なれば中止する ([`vault_file::save_vault`])。対話モードは、世代が戻った場合に終了する。
 //! - **鍵の更新 (実装済み)**: 利用者がリカバリーコードを控えたことを確認するまで Vault を書き換えず、
 //!   スロットの更新と全エントリの再暗号化を 1 回の保存で置き換える ([`rekey`], [`recover`], [`rotate_key`])。
-//! - **クリップボード (実装済み、サブコマンドからは未使用)**: 秘密のコピーは、自分自身を起動したワーカープロセスが行い、
+//! - **クリップボード (実装済み)**: 秘密のコピーは、自分自身を起動したワーカープロセスが行い、
 //!   30 秒後に、内容が変わっていなければ消去する。秘密のフィールドは履歴からの除外を指定する ([`sys::clipboard`])。
 //!   除外の指定を無視するクリップボードマネージャーには防御できない。
+//! - **平文の出力 (実装済み)**: 復号した値は、バッファを持たない出力先に書く ([`sys::tty::standard_output`])。
+//!   `export` は警告を表示して同意を求める ([`export`])。出力した後の値は、受け取った側が管理する。
+//! - **対話モード (実装済み)**: DEK を保持してコマンドを受け付け、`lock`、入力の終端、中断、
+//!   無操作の時間の上限で消去して終了する ([`unlock`])。
 //! - **リカバリーコード (実装済み)**: 128 bit の乱数にチェックサムを付けた、30 文字のコードを作る
 //!   ([`recovery_code::RecoveryCode`])。乱数は OS から取得する ([`sys::random::fill_random`])。
 //!   発行するサブコマンドは端末の代替画面に表示し、末尾の再入力を確認してから Vault を書き込む ([`init`], [`recovery_kit`])。
 //!   `recover` は、入力されたコードのチェックサムを鍵導出より前に検証する。
 //! - **メモリ保護 (一部実装)**: パスワードの入力バッファとリカバリーコードは `fidelogic_core` の `LockedBuffer` に置き、
 //!   `mlock` (スワップアウト抑止) に失敗した場合は処理を中止する。
-//!   DEK、正準化したパスワード、鍵導出の作業領域は `mlock` せず、破棄時に消去する。
+//!   DEK、正準化したパスワード、復号したエントリ、鍵導出の作業領域は `mlock` せず、破棄時に消去する。
 //! - **プロファイル連携**: [`fidelogic_core`] を `profile-vault` でリンクしている。
 //!   暗号処理とゼロ消去はコアが担う。
 //!
@@ -80,31 +86,49 @@
 #![deny(unsafe_code)]
 
 pub mod args;
+pub mod delete;
+mod display;
+pub mod entry_ops;
+mod entry_session;
 pub mod error;
 pub mod exit;
+pub mod export;
+mod export_json;
+pub mod get;
 pub mod init;
 mod interaction;
 mod key_update;
+pub mod list;
 pub mod password;
 pub mod recover;
 pub mod recovery_code;
 pub mod recovery_kit;
 pub mod rekey;
+mod repl_command;
 pub mod rotate_key;
 pub mod secret_input;
+pub mod set;
 pub mod sys;
+pub mod unlock;
 pub mod vault_file;
 
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::args::{CommandLine, ParseExit, Subcommand};
+use crate::delete::DeleteRequest;
 use crate::error::CliError;
 use crate::exit::ExitCategory;
+use crate::export::ExportRequest;
+use crate::get::GetRequest;
 use crate::init::InitRequest;
+use crate::list::ListRequest;
 use crate::recover::RecoverRequest;
 use crate::rotate_key::RotateKeyRequest;
+use crate::set::SetRequest;
+use crate::unlock::UnlockRequest;
 
 /// 標準エラー出力のメッセージの先頭に付けるプログラム名。
 pub const PROGRAM_NAME: &str = "fidelogic-cli";
@@ -123,12 +147,12 @@ pub fn run() -> ExitCode {
     }
 
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    run_with_args(
-        &args,
-        &mut std::io::stdout().lock(),
-        &mut std::io::stderr().lock(),
-    )
-    .into()
+    let mut stderr = std::io::stderr().lock();
+    // 標準ライブラリの標準出力のバッファは消去されないため、秘密の項目を書けるように、バッファを持たない出力先を使う。
+    let Ok(mut stdout) = sys::tty::standard_output() else {
+        return report_error(&mut stderr, CliError::OutputFailed).into();
+    };
+    run_with_args(&args, &mut stdout, &mut stderr).into()
 }
 
 /// 引数の列を解析し、サブコマンドを実行する。
@@ -172,18 +196,76 @@ pub fn run_with_args(
 /// # Errors
 ///
 /// サブコマンドの失敗を [`CliError`] で返す。
-/// `init`、`recover`、`rotate-key`、内部用の `__clipboard-worker` 以外のサブコマンドは、[`CliError::NotImplemented`] を返す。
 fn execute(
     command_line: &CommandLine,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<(), CliError> {
+    let vault = command_line.vault.as_deref();
+    let password_source = &command_line.password_source;
     match &command_line.subcommand {
         Subcommand::Init { kit_html } => init::run(
             InitRequest {
-                vault: command_line.vault.as_deref(),
-                password_source: &command_line.password_source,
+                vault,
+                password_source,
                 kit_html: kit_html.as_deref(),
+            },
+            stdout,
+            stderr,
+        ),
+        Subcommand::Unlock {
+            idle_timeout_seconds,
+        } => unlock::run(
+            UnlockRequest {
+                vault,
+                password_source,
+                idle_timeout: Duration::from_secs(*idle_timeout_seconds),
+            },
+            stdout,
+            stderr,
+        ),
+        Subcommand::List => list::run(
+            ListRequest {
+                vault,
+                password_source,
+            },
+            stdout,
+        ),
+        Subcommand::Get { entry, action } => get::run(
+            GetRequest {
+                vault,
+                password_source,
+                entry,
+                action: *action,
+            },
+            stdout,
+        ),
+        Subcommand::Set { entry, notes } => set::run(
+            SetRequest {
+                vault,
+                password_source,
+                entry,
+                notes,
+            },
+            stdout,
+            stderr,
+        ),
+        Subcommand::Delete { entry, assume_yes } => delete::run(
+            DeleteRequest {
+                vault,
+                password_source,
+                entry,
+                assume_yes: *assume_yes,
+            },
+            stdout,
+            stderr,
+        ),
+        Subcommand::Export { target, confirmed } => export::run(
+            ExportRequest {
+                vault,
+                password_source,
+                target,
+                confirmed: *confirmed,
             },
             stdout,
             stderr,
@@ -193,8 +275,8 @@ fn execute(
             kit_html,
         } => recover::run(
             RecoverRequest {
-                vault: command_line.vault.as_deref(),
-                password_source: &command_line.password_source,
+                vault,
+                password_source,
                 keep_recovery_code: *keep_recovery_code,
                 kit_html: kit_html.as_deref(),
             },
@@ -203,8 +285,8 @@ fn execute(
         ),
         Subcommand::RotateKey { mode, kit_html } => rotate_key::run(
             RotateKeyRequest {
-                vault: command_line.vault.as_deref(),
-                password_source: &command_line.password_source,
+                vault,
+                password_source,
                 mode: *mode,
                 kit_html: kit_html.as_deref(),
             },
@@ -215,7 +297,6 @@ fn execute(
         Subcommand::ClipboardWorker { policy } => {
             sys::clipboard::run_worker(*policy, stdout).map_err(CliError::from)
         }
-        _ => Err(CliError::NotImplemented(command_line.subcommand.name())),
     }
 }
 
@@ -310,24 +391,27 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_unimplemented_subcommand_fails_with_message() -> TestResult {
-        let (category, stdout, stderr) = run_strs(&["get", "github"])?;
-        assert_eq!(category, ExitCategory::Failure);
-        assert!(stdout.is_empty());
-        assert_eq!(
-            stderr,
-            format!("{PROGRAM_NAME}: サブコマンド `get` はまだ実装されていません。\n")
-        );
-        Ok(())
-    }
-
     /// `--vault` が必須のサブコマンドは、指定が無ければ、端末やファイルに触れる前に引数の誤りになること。
     #[test]
     fn test_missing_vault_is_a_usage_error() -> TestResult {
-        for name in ["init", "recover", "rotate-key"] {
-            let (category, stdout, stderr) = run_strs(&[name])?;
-            assert_eq!(category, ExitCategory::Usage, "{name} の分類の確認に失敗。");
+        let invocations: [&[&str]; 9] = [
+            &["init"],
+            &["recover"],
+            &["rotate-key"],
+            &["unlock"],
+            &["list"],
+            &["get", "github"],
+            &["set", "github"],
+            &["delete", "github"],
+            &["export", "--stdout"],
+        ];
+        for args in invocations {
+            let (category, stdout, stderr) = run_strs(args)?;
+            assert_eq!(
+                category,
+                ExitCategory::Usage,
+                "{args:?} の分類の確認に失敗。"
+            );
             assert!(stdout.is_empty());
             assert_eq!(
                 stderr,

@@ -2,7 +2,6 @@
 //!
 //! - 成功 (`--help`, `--version`) は終了コード 0 で標準出力に書く。
 //! - 引数の誤り (必須の `--vault` の指定漏れを含む) は終了コード 2 で、標準エラー出力に `fidelogic-cli: ` で始まる 1 行を書く。
-//! - 未実装のサブコマンドは終了コード 1 で、標準エラー出力にサブコマンド名を含む 1 行を書く。
 //! - 秘密を環境変数から読む経路 (`bpaf` の環境変数からの既定値) が `src/` に無い。
 
 use std::path::{Path, PathBuf};
@@ -10,15 +9,15 @@ use std::process::{Command, Output};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// 本体が未実装のサブコマンドの起動。`init`、`recover`、`rotate-key` の振る舞いは、
-/// サブコマンド名の統合テストで確かめる。
-const UNIMPLEMENTED_INVOCATIONS: [&[&str]; 6] = [
+/// `--vault` を省いた、エントリを扱うサブコマンドと `unlock` の起動。
+/// `init`、`recover`、`rotate-key` の振る舞いは、サブコマンド名の統合テストで確かめる。
+const INVOCATIONS_WITHOUT_VAULT: [&[&str]; 6] = [
     &["unlock"],
     &["list"],
     &["get", "github"],
     &["set", "github"],
     &["delete", "github"],
-    &["export"],
+    &["export", "--stdout"],
 ];
 
 fn run_binary(args: &[&str]) -> std::io::Result<Output> {
@@ -92,26 +91,21 @@ fn test_invalid_arguments_exit_with_two() -> TestResult {
     Ok(())
 }
 
+/// `--vault` の指定漏れは、端末やファイルに触れる前に、引数の誤りになること。
 #[test]
-fn test_unimplemented_subcommands_exit_with_one() -> TestResult {
-    for args in UNIMPLEMENTED_INVOCATIONS {
+fn test_missing_vault_exits_with_two() -> TestResult {
+    for args in INVOCATIONS_WITHOUT_VAULT {
         let output = run_binary(args)?;
         let stderr = String::from_utf8(output.stderr.clone())?;
         assert_eq!(
             exit_code(&output)?,
-            1,
+            2,
             "{args:?} の終了コードの確認に失敗。"
         );
-        assert!(
-            output.stdout.is_empty(),
-            "{args:?} の標準出力が空ではありません。"
-        );
+        assert!(output.stdout.is_empty());
         assert_eq!(
-            stderr,
-            format!(
-                "fidelogic-cli: サブコマンド `{}` はまだ実装されていません。\n",
-                args[0]
-            ),
+            stderr, "fidelogic-cli: `--vault <PATH>` で Vault のパスを指定してください。\n",
+            "{args:?} の理由の表示の確認に失敗。"
         );
     }
     Ok(())

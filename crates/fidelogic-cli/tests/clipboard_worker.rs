@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use fidelogic_cli::sys::clipboard::{
     CLEAR_DELAY, ClipboardError, HistoryPolicy, MAX_TEXT_LEN, WORKER_SUBCOMMAND, copy_via_worker,
+    reap_finished_workers,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -263,6 +264,58 @@ fn test_parent_starts_worker_with_expected_arguments_and_input() -> TestResult {
     );
     assert_eq!(std::fs::read_to_string(directory.0.join("cwd"))?, "/\n");
     assert_eq!(std::fs::read_to_string(directory.0.join("input"))?, secret);
+    Ok(())
+}
+
+/// プロセスが存在するか (回収していないゾンビを含む) を返す。
+fn process_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: シグナル 0 は送信せず、対象の有無だけを調べる。
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// コピーに成功する偽のワーカーを起動し、その PID を返す。応答の後は `after_reply` を実行する。
+fn start_fake_worker(
+    directory: &TempDir,
+    after_reply: &str,
+) -> Result<libc::pid_t, Box<dyn std::error::Error>> {
+    let output = directory.0.display();
+    let script = write_script(
+        directory,
+        &format!("cat > /dev/null\necho $$ > '{output}/pid'\nprintf '\\001'\n{after_reply}"),
+    )?;
+    copy_within_timeout(&script, "s3cret", HistoryPolicy::Allow)??;
+    Ok(std::fs::read_to_string(directory.0.join("pid"))?
+        .trim()
+        .parse()?)
+}
+
+/// 終了したワーカーは回収し、実行中のワーカーは待たずに残すこと。
+#[test]
+fn test_reap_collects_only_finished_workers() -> TestResult {
+    let running_directory = TempDir::new()?;
+    let running = start_fake_worker(&running_directory, "exec sleep 10")?;
+    let finished_directory = TempDir::new()?;
+    let finished = start_fake_worker(&finished_directory, "exit 0")?;
+    assert!(
+        process_exists(finished),
+        "回収の前に子プロセスが残ることの確認に失敗。"
+    );
+
+    let started = Instant::now();
+    while process_exists(finished) {
+        assert!(
+            started.elapsed() < FAILURE_TIMEOUT,
+            "終了したワーカーの回収に失敗。"
+        );
+        reap_finished_workers();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let still_running = process_exists(running);
+    // SAFETY: このテストが起動した子を終了させるだけで、メモリを参照しない。
+    unsafe {
+        libc::kill(running, libc::SIGKILL);
+    }
+    assert!(still_running, "実行中のワーカーを残すことの確認に失敗。");
     Ok(())
 }
 

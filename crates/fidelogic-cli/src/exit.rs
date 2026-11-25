@@ -6,7 +6,7 @@
 //! | 分類 | 終了コード | 用途 |
 //! | :-- | --: | :-- |
 //! | [`ExitCategory::Success`] | 0 | 成功。`--help` と `--version` の表示を含む |
-//! | [`ExitCategory::Failure`] | 1 | 一般の失敗 (プロセス硬化、入出力、未実装のサブコマンド、世代の巻き戻しなど) |
+//! | [`ExitCategory::Failure`] | 1 | 一般の失敗 (プロセス硬化、入出力、エントリの指定の誤り、世代の巻き戻しなど) |
 //! | [`ExitCategory::Usage`] | 2 | 引数の誤り |
 //! | [`ExitCategory::AuthenticationFailed`] | 3 | 認証の失敗 (理由によらず 1 つにまとめる) |
 //! | [`ExitCategory::Interrupted`] | 130 | シグナル (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`) による中断。種類によらず `128 + SIGINT` |

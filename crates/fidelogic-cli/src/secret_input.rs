@@ -28,6 +28,8 @@
 //! [`read_password`] は [`InterruptWatcher`] を受け取る。中断のシグナルを受けた場合は、
 //! 端末属性を元に戻し、読み込み途中の内容を消去して [`SecretInputError::Interrupted`] を返す。
 //! 呼び出し側は、返った秘密を破棄し終えるまで [`InterruptWatcher`] を保持する。
+//! [`InterruptWatcher::set_idle_limit`] を設定している場合、上限の間に入力が進まなければ、
+//! 同じ後始末をして [`TtyError::IdleTimeout`] を返す。
 
 use core::fmt;
 use std::path::PathBuf;
@@ -636,6 +638,8 @@ mod tests {
             SecretInputError::Tty(TtyError::DescriptorIsTerminal),
             SecretInputError::Tty(TtyError::PasswordFileNotRegular),
             SecretInputError::Tty(TtyError::PasswordFilePermissions),
+            SecretInputError::Tty(TtyError::IdleTimeout),
+            SecretInputError::Tty(TtyError::NotesFileNotRegular),
             SecretInputError::Tty(TtyError::Os {
                 step: TtyStep::Read,
                 errno: 9,

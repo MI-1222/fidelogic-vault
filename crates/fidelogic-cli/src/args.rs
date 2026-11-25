@@ -9,13 +9,13 @@
 //! | サブコマンド | 引数 | 内容 |
 //! | :-- | :-- | :-- |
 //! | `init` | `--kit-html <PATH>` (任意) | Vault を作成し、リカバリーキットを表示する |
-//! | `unlock` | | Vault を解錠し、対話モードに入る |
+//! | `unlock` | `--idle-timeout <SECS>` (任意、既定 300) | Vault を解錠し、対話モードに入る |
 //! | `list` | | エントリの一覧を表示する (秘密のフィールドは表示しない) |
-//! | `get` | `<ENTRY>` | エントリを表示する |
-//! | `set` | `<ENTRY>` | エントリを追加・更新する |
-//! | `delete` | `<ENTRY>` | エントリを削除する |
+//! | `get` | `<ENTRY>`、`--field <FIELD>` または `--clip <FIELD>` (任意) | エントリを表示、出力、コピーする |
+//! | `set` | `<ENTRY>`、`--notes-file <PATH>` または `--notes-stdin` (任意) | エントリを追加・更新する |
+//! | `delete` | `<ENTRY>`、`--yes` (任意) | エントリを削除する |
 //! | `rotate-key` | `--kek-only` (既定) `[--new-recovery-code]` または `--full-dek [--drop-prf-slot]`、`--kit-html <PATH>` (任意) | 鍵を更新する |
-//! | `export` | | Vault の内容を書き出す |
+//! | `export` | `--output <PATH>` または `--stdout` (必須)、`--confirm-plaintext` (任意) | 全エントリを平文の JSON で書き出す |
 //! | `recover` | `--keep-recovery-code` (任意)、`--kit-html <PATH>` (任意) | リカバリーコードで解錠し、マスターパスワードを再設定する |
 //!
 //! このほかに、ヘルプに表示しない内部用のサブコマンド `__clipboard-worker` がある。
@@ -25,7 +25,7 @@
 //! すべてのサブコマンドが `--vault <PATH>` と、パスワードの入力元の指定を受け付ける。
 //! 指定はサブコマンド名の後に置く。
 //! (`fidelogic-cli get --vault ./my.vault github`)。省略したときの既定のパスは、Vault を読み書きする処理で決める。
-//! `init`、`recover`、`rotate-key` は省略を認めない。
+//! 実行できるすべてのサブコマンドが、省略を認めない。
 //!
 //! `--kit-html` は、リカバリーコードを発行する場合 (`init`、`--keep-recovery-code` の無い `recover`、
 //! `--new-recovery-code` または `--full-dek` の `rotate-key`) だけ受け付ける。
@@ -43,7 +43,14 @@
 //! `recover` の指定は新しいパスワードの入力元で、リカバリーコードは端末で入力する。
 //!
 //! 3 つの指定は同時に使えない。`unlock` は標準入力をコマンドの入力に使うため、
-//! `--password-stdin` と `--password-fd 0` を拒否する。読み込みは [`crate::secret_input`] が行う。
+//! `--password-stdin` と `--password-fd 0` を拒否する。`set` は、`--notes-stdin` との併用で同じ指定を拒否する。
+//! 読み込みは [`crate::secret_input`] が行う。
+//!
+//! ## 非対話の実行の同意
+//!
+//! パスワードの入力元を指定した実行は、非対話とみなす。この場合、`delete` は `--yes` を、
+//! `export` は `--confirm-plaintext` を必須とする。指定が無ければ、引数の誤りにする。
+//! 端末からパスワードを読み込む場合は、指定が無ければ実行の途中で同意を求める。
 //!
 //! ## 秘密を引数と環境変数で受け取らない
 //!
@@ -60,8 +67,14 @@ use bpaf::parsers::NamedArg;
 use bpaf::{Args, OptionParser, ParseFailure, Parser, construct, long, positional, pure, short};
 use fidelogic_core::active_profile;
 
+use crate::entry_ops::{EntryField, GetAction};
+use crate::export::ExportTarget;
 use crate::secret_input::PasswordSource;
-use crate::sys::clipboard::{EXCLUDE_FROM_HISTORY_FLAG, HistoryPolicy, WORKER_SUBCOMMAND};
+use crate::set::NotesSource;
+use crate::sys::clipboard::{
+    EXCLUDE_FROM_HISTORY_FLAG, HISTORY_WARNING, HistoryPolicy, WORKER_SUBCOMMAND,
+};
+use crate::unlock::{DEFAULT_IDLE_TIMEOUT_SECONDS, MAX_IDLE_TIMEOUT_SECONDS};
 
 /// 解析に成功した引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,23 +96,32 @@ pub enum Subcommand {
         kit_html: Option<PathBuf>,
     },
     /// `unlock`: Vault を解錠し、対話モードに入る。
-    Unlock,
+    Unlock {
+        /// `--idle-timeout`: 無操作の時間の上限 (秒)。
+        idle_timeout_seconds: u64,
+    },
     /// `list`: エントリの一覧を表示する。
     List,
     /// `get <ENTRY>`: エントリを表示する。
     Get {
         /// 対象のエントリ。
         entry: String,
+        /// `--field`, `--clip`: 出力の方法。指定が無ければ、秘密を伏せた表示。
+        action: GetAction,
     },
     /// `set <ENTRY>`: エントリを追加・更新する。
     Set {
         /// 対象のエントリ。
         entry: String,
+        /// `--notes-file`, `--notes-stdin`: メモの入力元。指定が無ければ制御端末。
+        notes: NotesSource,
     },
     /// `delete <ENTRY>`: エントリを削除する。
     Delete {
         /// 対象のエントリ。
         entry: String,
+        /// `--yes`: 同意を求めずに削除する。
+        assume_yes: bool,
     },
     /// `rotate-key`: 鍵を更新する。
     RotateKey {
@@ -109,7 +131,12 @@ pub enum Subcommand {
         kit_html: Option<PathBuf>,
     },
     /// `export`: Vault の内容を書き出す。
-    Export,
+    Export {
+        /// `--output`, `--stdout`: 出力先。
+        target: ExportTarget,
+        /// `--confirm-plaintext`: 同意を求めずに平文を書き出す。
+        confirmed: bool,
+    },
     /// `recover`: リカバリーコードで解錠し、マスターパスワードを再設定する。
     Recover {
         /// `--keep-recovery-code`: リカバリーコードを再発行せず、使ったコードを残す。
@@ -132,13 +159,13 @@ impl Subcommand {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Init { .. } => "init",
-            Self::Unlock => "unlock",
+            Self::Unlock { .. } => "unlock",
             Self::List => "list",
             Self::Get { .. } => "get",
             Self::Set { .. } => "set",
             Self::Delete { .. } => "delete",
             Self::RotateKey { .. } => "rotate-key",
-            Self::Export => "export",
+            Self::Export { .. } => "export",
             Self::Recover { .. } => "recover",
             Self::ClipboardWorker { .. } => WORKER_SUBCOMMAND,
         }
@@ -223,37 +250,45 @@ fn parser() -> OptionParser<CommandLine> {
         "Vault を作成し、リカバリーキットを表示する (--vault の指定が必須)",
         kit_html_option().map(|kit_html| Subcommand::Init { kit_html }),
     );
-    let unlock = subcommand(
+    let unlock = subcommand_with_footer(
         "unlock",
-        "Vault を解錠し、対話モードに入る",
-        pure(Subcommand::Unlock),
+        "Vault を解錠し、対話モードに入る (--vault の指定が必須)",
+        idle_timeout_option().map(|idle_timeout_seconds| Subcommand::Unlock {
+            idle_timeout_seconds,
+        }),
+        Some(HISTORY_WARNING),
     );
     let list = subcommand(
         "list",
-        "エントリの一覧を表示する (秘密のフィールドは表示しない)",
+        "エントリの一覧を表示する。秘密のフィールドは表示しない (--vault の指定が必須)",
         pure(Subcommand::List),
     );
-    let get = subcommand(
+    let get = subcommand_with_footer(
         "get",
-        "エントリを表示する",
-        entry_argument().map(|entry| Subcommand::Get { entry }),
+        "エントリを表示する。パスワード、TOTP、メモは伏せる (--vault の指定が必須)",
+        get_arguments(),
+        Some(HISTORY_WARNING),
     );
     let set = subcommand(
         "set",
-        "エントリを追加・更新する",
-        entry_argument().map(|entry| Subcommand::Set { entry }),
+        "エントリを追加・更新する。値は端末で入力する (--vault の指定が必須)",
+        set_arguments(),
     );
     let delete = subcommand(
         "delete",
-        "エントリを削除する",
-        entry_argument().map(|entry| Subcommand::Delete { entry }),
+        "エントリを削除する (--vault の指定が必須)",
+        delete_arguments(),
     );
     let rotate_key = subcommand(
         "rotate-key",
         "鍵を更新する (--vault の指定が必須。--password-* は現在のパスワードの入力元)",
         rotate_key_arguments(),
     );
-    let export = subcommand("export", "Vault の内容を書き出す", pure(Subcommand::Export));
+    let export = subcommand(
+        "export",
+        "全エントリを平文の JSON で書き出す (--vault の指定が必須)",
+        export_arguments(),
+    );
     let recover = subcommand(
         "recover",
         "リカバリーコードで解錠し、マスターパスワードを再設定する (--vault の指定が必須。--password-* は新しいパスワードの入力元)",
@@ -290,8 +325,45 @@ fn parser() -> OptionParser<CommandLine> {
 ///
 /// `unlock` は、対話モードのコマンドを標準入力から読み込む。
 fn does_not_share_standard_input(command_line: &CommandLine) -> bool {
-    !(command_line.subcommand == Subcommand::Unlock
+    !(matches!(command_line.subcommand, Subcommand::Unlock { .. })
         && command_line.password_source.reads_standard_input())
+}
+
+/// メモとパスワードの両方を、標準入力から読み込む指定でないかを判定する。
+fn does_not_read_standard_input_twice(command_line: &CommandLine) -> bool {
+    !(matches!(
+        command_line.subcommand,
+        Subcommand::Set {
+            notes: NotesSource::StandardInput,
+            ..
+        }
+    ) && command_line.password_source.reads_standard_input())
+}
+
+/// 非対話の実行の `delete` が、同意の指定を持つかを判定する。
+///
+/// パスワードの入力元を指定した実行は、非対話とみなす。
+fn has_deletion_consent(command_line: &CommandLine) -> bool {
+    command_line.password_source == PasswordSource::Terminal
+        || !matches!(
+            command_line.subcommand,
+            Subcommand::Delete {
+                assume_yes: false,
+                ..
+            }
+        )
+}
+
+/// 非対話の実行の `export` が、同意の指定を持つかを判定する。
+fn has_plaintext_consent(command_line: &CommandLine) -> bool {
+    command_line.password_source == PasswordSource::Terminal
+        || !matches!(
+            command_line.subcommand,
+            Subcommand::Export {
+                confirmed: false,
+                ..
+            }
+        )
 }
 
 /// サブコマンドの解析器を組み立てる。すべてのサブコマンドに、`--vault` とパスワードの入力元の指定を付ける。
@@ -300,10 +372,20 @@ fn subcommand(
     description: &'static str,
     arguments: impl Parser<Subcommand> + 'static,
 ) -> impl Parser<CommandLine> {
+    subcommand_with_footer(name, description, arguments, None)
+}
+
+/// [`subcommand`] と同じ解析器を、ヘルプの末尾の説明を付けて組み立てる。
+fn subcommand_with_footer(
+    name: &'static str,
+    description: &'static str,
+    arguments: impl Parser<Subcommand> + 'static,
+    footer: Option<&'static str>,
+) -> impl Parser<CommandLine> {
     let vault = vault_option();
     let password_source = password_source_options();
     let subcommand = arguments;
-    construct!(CommandLine {
+    let parser = construct!(CommandLine {
         vault,
         password_source,
         subcommand
@@ -312,11 +394,26 @@ fn subcommand(
         does_not_share_standard_input,
         "`unlock` は標準入力をコマンドの入力に使うため、パスワードの入力元に標準入力を指定できません。",
     )
+    .guard(
+        does_not_read_standard_input_twice,
+        "メモとパスワードの両方を、標準入力から読み込むことはできません。",
+    )
+    .guard(
+        has_deletion_consent,
+        "`--password-*` を指定した `delete` は非対話の実行とみなすため、`--yes` を指定してください。",
+    )
+    .guard(
+        has_plaintext_consent,
+        "`--password-*` を指定した `export` は非対話の実行とみなすため、`--confirm-plaintext` を指定してください。",
+    )
     .to_options()
-        .descr(description)
-        .help_parser(help_flag())
-        .command(name)
-        .help(description)
+    .descr(description)
+    .help_parser(help_flag());
+    let parser = match footer {
+        Some(footer) => parser.footer(footer),
+        None => parser,
+    };
+    parser.command(name).help(description)
 }
 
 /// 内部用のサブコマンド `__clipboard-worker` の解析器を組み立てる。ヘルプには表示しない。
@@ -423,7 +520,76 @@ fn rotate_key_arguments() -> impl Parser<Subcommand> {
 
 /// `get` / `set` / `delete` が受け取る対象のエントリ。
 fn entry_argument() -> impl Parser<String> {
-    positional::<String>("ENTRY").help("対象のエントリ")
+    positional::<String>("ENTRY").help("対象のエントリのタイトル (完全一致)")
+}
+
+/// `get` の指定。`--field` と `--clip` は同時に指定できない。
+fn get_arguments() -> impl Parser<Subcommand> {
+    let print = long("field")
+        .help("指定した項目の値だけを標準出力に書く (username, password, url, totp, notes)")
+        .argument::<EntryField>("FIELD")
+        .map(GetAction::Print);
+    let copy = long("clip")
+        .help("指定した項目の値をクリップボードへコピーする (username, password, url, totp, notes)")
+        .argument::<EntryField>("FIELD")
+        .map(GetAction::Copy);
+    let action = construct!([print, copy]).fallback(GetAction::Summary);
+    let entry = entry_argument();
+    construct!(action, entry).map(|(action, entry)| Subcommand::Get { entry, action })
+}
+
+/// `set` の指定。`--notes-file` と `--notes-stdin` は同時に指定できない。
+fn set_arguments() -> impl Parser<Subcommand> {
+    let file = long("notes-file")
+        .help("メモをファイルから読み込む")
+        .argument::<PathBuf>("PATH")
+        .map(NotesSource::File);
+    let standard_input = long("notes-stdin")
+        .help("メモを標準入力から読み込む")
+        .req_flag(NotesSource::StandardInput);
+    let notes = construct!([file, standard_input]).fallback(NotesSource::Prompt);
+    let entry = entry_argument();
+    construct!(notes, entry).map(|(notes, entry)| Subcommand::Set { entry, notes })
+}
+
+/// `delete` の指定。
+fn delete_arguments() -> impl Parser<Subcommand> {
+    let assume_yes = long("yes")
+        .help("同意を求めずに削除する (--password-* と併用する場合は必須)")
+        .switch();
+    let entry = entry_argument();
+    construct!(assume_yes, entry)
+        .map(|(assume_yes, entry)| Subcommand::Delete { entry, assume_yes })
+}
+
+/// `export` の指定。`--output` と `--stdout` のどちらか一方が必要である。
+fn export_arguments() -> impl Parser<Subcommand> {
+    let file = long("output")
+        .help("権限 0600 の新しいファイルに書き出す。既存のファイルは上書きしない")
+        .argument::<PathBuf>("PATH")
+        .map(ExportTarget::File);
+    let standard_output = long("stdout")
+        .help("標準出力に書き出す")
+        .req_flag(ExportTarget::StandardOutput);
+    let target = construct!([file, standard_output]);
+    let confirmed = long("confirm-plaintext")
+        .help("同意を求めずに平文を書き出す (--password-* と併用する場合は必須)")
+        .switch();
+    construct!(target, confirmed)
+        .map(|(target, confirmed)| Subcommand::Export { target, confirmed })
+}
+
+/// `unlock` の `--idle-timeout <SECS>` の定義。
+fn idle_timeout_option() -> impl Parser<u64> {
+    long("idle-timeout")
+        .help("無操作の時間がこの秒数に達したら施錠する (1 から 86400)")
+        .argument::<u64>("SECS")
+        .guard(
+            |seconds| (1..=MAX_IDLE_TIMEOUT_SECONDS).contains(seconds),
+            "`--idle-timeout` は 1 から 86400 の秒数で指定してください。",
+        )
+        .fallback(DEFAULT_IDLE_TIMEOUT_SECONDS)
+        .display_fallback()
 }
 
 /// `rotate-key` の方式の指定。
@@ -459,8 +625,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{CommandLine, ParseExit, RotateMode, Subcommand, parse};
+    use crate::entry_ops::{EntryField, GetAction};
+    use crate::export::ExportTarget;
     use crate::secret_input::PasswordSource;
-    use crate::sys::clipboard::HistoryPolicy;
+    use crate::set::NotesSource;
+    use crate::sys::clipboard::{HISTORY_WARNING, HistoryPolicy};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -471,9 +640,10 @@ mod tests {
         &["list"],
         &["get", "github"],
         &["set", "github"],
-        &["delete", "github"],
+        // パスワードの入力元を指定する実行は非対話とみなすため、同意の指定を付けておく。
+        &["delete", "github", "--yes"],
         &["rotate-key"],
-        &["export"],
+        &["export", "--stdout", "--confirm-plaintext"],
         &["recover"],
     ];
 
@@ -563,21 +733,267 @@ mod tests {
         assert_eq!(
             parse_strs(&["get", "github"])?.subcommand,
             Subcommand::Get {
-                entry: "github".to_owned()
+                entry: "github".to_owned(),
+                action: GetAction::Summary,
             }
         );
         assert_eq!(
             parse_strs(&["set", "mail"])?.subcommand,
             Subcommand::Set {
-                entry: "mail".to_owned()
+                entry: "mail".to_owned(),
+                notes: NotesSource::Prompt,
             }
         );
         assert_eq!(
             parse_strs(&["delete", "bank"])?.subcommand,
             Subcommand::Delete {
-                entry: "bank".to_owned()
+                entry: "bank".to_owned(),
+                assume_yes: false,
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_output_options() -> TestResult {
+        let cases: [(&[&str], GetAction); 6] = [
+            (&["get", "x"], GetAction::Summary),
+            (
+                &["get", "x", "--field", "password"],
+                GetAction::Print(EntryField::Password),
+            ),
+            (
+                &["get", "--field=username", "x"],
+                GetAction::Print(EntryField::Username),
+            ),
+            (
+                &["get", "x", "--clip", "totp"],
+                GetAction::Copy(EntryField::Totp),
+            ),
+            (
+                &["get", "--clip=url", "x"],
+                GetAction::Copy(EntryField::Url),
+            ),
+            (
+                &["get", "--field", "notes", "--", "x"],
+                GetAction::Print(EntryField::Notes),
+            ),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(
+                parse_strs(args)?.subcommand,
+                Subcommand::Get {
+                    entry: "x".to_owned(),
+                    action: expected,
+                },
+                "{args:?} の解析に失敗。"
+            );
+        }
+        for args in [
+            &["get", "x", "--field"][..],
+            &["get", "x", "--clip"],
+            &["get", "x", "--field", "title"],
+            &["get", "x", "--clip", "Password"],
+            &["get", "x", "--field", "password", "--clip", "totp"],
+            &["get", "x", "--field", "password", "--field", "totp"],
+            &["get", "x", "--clip", "totp", "--clip", "totp"],
+            &["get", "x", "--yes"],
+        ] {
+            expect_invalid(args)?;
+        }
+        let message = expect_invalid(&["get", "x", "--field", "title"])?;
+        assert!(
+            message.contains("username, password, url, totp, notes"),
+            "項目の一覧の表示の確認に失敗: {message}"
+        );
+        Ok(())
+    }
+
+    /// クリップボードへコピーできるサブコマンドのヘルプに、履歴による漏洩の警告を表示すること。
+    #[test]
+    fn test_help_of_copying_subcommands_shows_history_warning() -> TestResult {
+        // ヘルプは端末の幅で折り返すため、空白と改行を除いて比較する。
+        let compact = |text: &str| text.split_whitespace().collect::<String>();
+        for name in ["get", "unlock"] {
+            let help = match parse_strs(&[name, "--help"]) {
+                Err(ParseExit::Help(text)) => text,
+                other => return Err(format!("{name} --help の解析に失敗: {other:?}").into()),
+            };
+            assert!(
+                compact(&help).contains(&compact(HISTORY_WARNING)),
+                "{name} のヘルプの警告の確認に失敗: {help}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_set_notes_sources() -> TestResult {
+        for (args, expected) in [
+            (
+                &["set", "x", "--notes-file", "./key"][..],
+                NotesSource::File(PathBuf::from("./key")),
+            ),
+            (&["set", "--notes-stdin", "x"], NotesSource::StandardInput),
+            (
+                &["set", "x", "--notes-stdin", "--password-file", "p"],
+                NotesSource::StandardInput,
+            ),
+            (
+                &["set", "x", "--notes-stdin", "--password-fd", "3"],
+                NotesSource::StandardInput,
+            ),
+        ] {
+            assert_eq!(
+                parse_strs(args)?.subcommand,
+                Subcommand::Set {
+                    entry: "x".to_owned(),
+                    notes: expected,
+                },
+                "{args:?} の解析に失敗。"
+            );
+        }
+        parse_strs(&["set", "x", "--notes-file", "n", "--password-stdin"])?;
+        for args in [
+            &["set", "x", "--notes-file"][..],
+            &["set", "x", "--notes-file", "a", "--notes-stdin"],
+            &["set", "x", "--notes-file", "a", "--notes-file", "b"],
+            &["set", "x", "--notes-stdin", "--notes-stdin"],
+            &["set", "x", "--notes", "secret"],
+        ] {
+            expect_invalid(args)?;
+        }
+        for source in [&["--password-stdin"][..], &["--password-fd", "0"]] {
+            let args: Vec<&str> = ["set", "x", "--notes-stdin"]
+                .iter()
+                .chain(source)
+                .copied()
+                .collect();
+            let message = expect_invalid(&args)?;
+            assert!(
+                message.contains("標準入力"),
+                "{args:?} の理由の表示の確認に失敗: {message}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_requires_yes_for_non_interactive_password() -> TestResult {
+        for (args, assume_yes) in [
+            (&["delete", "x"][..], false),
+            (&["delete", "x", "--yes"], true),
+            (&["delete", "--yes", "--password-stdin", "x"], true),
+        ] {
+            assert_eq!(
+                parse_strs(args)?.subcommand,
+                Subcommand::Delete {
+                    entry: "x".to_owned(),
+                    assume_yes,
+                },
+                "{args:?} の解析に失敗。"
+            );
+        }
+        for source in [
+            &["--password-stdin"][..],
+            &["--password-file", "p"],
+            &["--password-fd", "3"],
+        ] {
+            let args: Vec<&str> = ["delete", "x"].iter().chain(source).copied().collect();
+            let message = expect_invalid(&args)?;
+            assert!(
+                message.contains("--yes"),
+                "{args:?} の理由の表示の確認に失敗: {message}"
+            );
+        }
+        expect_invalid(&["delete", "x", "--yes", "--yes"])?;
+        expect_invalid(&["delete", "x", "-y"])?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_export_targets_and_confirmation() -> TestResult {
+        let file = ExportTarget::File(PathBuf::from("dump.json"));
+        for (args, target, confirmed) in [
+            (
+                &["export", "--stdout"][..],
+                ExportTarget::StandardOutput,
+                false,
+            ),
+            (&["export", "--output", "dump.json"], file.clone(), false),
+            (
+                &["export", "--output=dump.json", "--confirm-plaintext"],
+                file.clone(),
+                true,
+            ),
+            (
+                &[
+                    "export",
+                    "--confirm-plaintext",
+                    "--stdout",
+                    "--password-stdin",
+                ],
+                ExportTarget::StandardOutput,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                parse_strs(args)?.subcommand,
+                Subcommand::Export { target, confirmed },
+                "{args:?} の解析に失敗。"
+            );
+        }
+        for args in [
+            &["export"][..],
+            &["export", "--confirm-plaintext"],
+            &["export", "--output"],
+            &["export", "--stdout", "--output", "a"],
+            &["export", "--stdout", "--stdout"],
+            &["export", "--output", "a", "--output", "b"],
+            &["export", "dump.json"],
+        ] {
+            expect_invalid(args)?;
+        }
+        for source in [
+            &["--password-stdin"][..],
+            &["--password-file", "p"],
+            &["--password-fd", "3"],
+        ] {
+            let args: Vec<&str> = ["export", "--stdout"]
+                .iter()
+                .chain(source)
+                .copied()
+                .collect();
+            let message = expect_invalid(&args)?;
+            assert!(
+                message.contains("--confirm-plaintext"),
+                "{args:?} の理由の表示の確認に失敗: {message}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_unlock_idle_timeout() -> TestResult {
+        for (args, expected) in [
+            (&["unlock"][..], 300),
+            (&["unlock", "--idle-timeout", "1"], 1),
+            (&["unlock", "--idle-timeout=86400"], 86_400),
+        ] {
+            assert_eq!(
+                parse_strs(args)?.subcommand,
+                Subcommand::Unlock {
+                    idle_timeout_seconds: expected
+                },
+                "{args:?} の解析に失敗。"
+            );
+        }
+        for value in ["0", "86401", "-1", "1.5", "abc", "", "18446744073709551616"] {
+            expect_invalid(&["unlock", &format!("--idle-timeout={value}")])?;
+        }
+        expect_invalid(&["unlock", "--idle-timeout"])?;
+        expect_invalid(&["unlock", "--idle-timeout", "1", "--idle-timeout", "2"])?;
+        expect_invalid(&["list", "--idle-timeout", "1"])?;
         Ok(())
     }
 
@@ -629,7 +1045,8 @@ mod tests {
         assert_eq!(
             parse_strs(&["get", "--", "-foo"])?.subcommand,
             Subcommand::Get {
-                entry: "-foo".to_owned()
+                entry: "-foo".to_owned(),
+                action: GetAction::Summary,
             }
         );
         Ok(())

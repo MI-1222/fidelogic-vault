@@ -16,10 +16,12 @@ use core::fmt;
 
 use fidelogic_core::{SystemError, VaultError};
 
+use crate::entry_ops::EntryField;
 use crate::exit::ExitCategory;
 use crate::password::PasswordError;
 use crate::recovery_code::RecoveryCodeError;
-use crate::secret_input::SecretInputError;
+use crate::secret_input::{MAX_PASSWORD_LEN, SecretInputError};
+use crate::set::MAX_NOTES_LEN;
 use crate::sys::clipboard::ClipboardError;
 use crate::sys::process::HardeningError;
 use crate::sys::signal::SignalError;
@@ -38,8 +40,6 @@ pub const AUTHENTICATION_FAILED_MESSAGE: &str = "Vault の解錠に失敗しま�
 pub enum CliError {
     /// 起動時のプロセス硬化に失敗した。
     Hardening(HardeningError),
-    /// サブコマンドがまだ実装されていない。値はサブコマンド名である。
-    NotImplemented(&'static str),
     /// Vault の解錠または読み込みに失敗した。理由を区別しない。
     AuthenticationFailed,
     /// Vault の世代 (`epoch_id`) が、以前に読み込んだものより古い。
@@ -94,6 +94,32 @@ pub enum CliError {
     PrfSlotRequiresDrop,
     /// WebAuthn PRF のスロットの破棄に、利用者が同意しなかった。
     PrfSlotDropDeclined,
+    /// 指定されたタイトルのエントリが無い。
+    EntryNotFound,
+    /// 指定されたタイトルのエントリが複数ある。
+    EntryAmbiguous,
+    /// 新しいエントリのタイトルとして使えない。
+    InvalidEntryName,
+    /// 認証に成功したエントリを、クレデンシャルとして解釈できない。
+    MalformedEntry,
+    /// 指定された項目に値が無い。
+    FieldNotSet,
+    /// 入力された項目の値を受け付けられない (使用できない文字、UTF-8 でない)。
+    InvalidField(EntryField),
+    /// 端末から入力した項目の値が、上限を超える。
+    FieldTooLong(EntryField),
+    /// 項目の入力の途中で、端末の入力が終わった。
+    EntryInputAborted,
+    /// ファイルまたは標準入力のメモが、上限を超える。
+    NotesTooLong,
+    /// ファイルまたは標準入力のメモが空である。
+    NotesEmpty,
+    /// エントリの削除に、利用者が同意しなかった。
+    DeletionDeclined,
+    /// 平文の書き出しに、利用者が同意しなかった。
+    ExportDeclined,
+    /// 書き出し先に、ファイルがすでに存在する。
+    ExportDestinationExists,
 }
 
 impl CliError {
@@ -202,7 +228,6 @@ impl CliError {
             Self::VaultPathRequired => ExitCategory::Usage,
             Self::SecretInput(_)
             | Self::Hardening(_)
-            | Self::NotImplemented(_)
             | Self::RollbackDetected
             | Self::InvalidState
             | Self::OutputFailed
@@ -225,7 +250,20 @@ impl CliError {
             | Self::VaultSaveFailed
             | Self::RecoveryCodeNotEntered
             | Self::PrfSlotRequiresDrop
-            | Self::PrfSlotDropDeclined => ExitCategory::Failure,
+            | Self::PrfSlotDropDeclined
+            | Self::EntryNotFound
+            | Self::EntryAmbiguous
+            | Self::InvalidEntryName
+            | Self::MalformedEntry
+            | Self::FieldNotSet
+            | Self::InvalidField(_)
+            | Self::FieldTooLong(_)
+            | Self::EntryInputAborted
+            | Self::NotesTooLong
+            | Self::NotesEmpty
+            | Self::DeletionDeclined
+            | Self::ExportDeclined
+            | Self::ExportDestinationExists => ExitCategory::Failure,
         }
     }
 }
@@ -282,12 +320,6 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Hardening(error) => write!(formatter, "{error}"),
-            Self::NotImplemented(name) => {
-                write!(
-                    formatter,
-                    "サブコマンド `{name}` はまだ実装されていません。"
-                )
-            }
             Self::AuthenticationFailed => formatter.write_str(AUTHENTICATION_FAILED_MESSAGE),
             Self::RollbackDetected => formatter
                 .write_str("Vault の世代が以前に読み込んだものより古いため、処理を中止しました。"),
@@ -335,6 +367,37 @@ impl fmt::Display for CliError {
             Self::PrfSlotDropDeclined => formatter.write_str(
                 "WebAuthn PRF のスロットを破棄しないため、鍵の更新を中止しました。",
             ),
+            Self::EntryNotFound => formatter.write_str("指定されたエントリがありません。"),
+            Self::EntryAmbiguous => formatter
+                .write_str("同じタイトルのエントリが複数あるため、処理を中止しました。"),
+            Self::InvalidEntryName => formatter
+                .write_str("エントリのタイトルに、空の文字列と制御文字は使えません。"),
+            Self::MalformedEntry => formatter
+                .write_str("Vault に解釈できないエントリがあるため、処理を中止しました。"),
+            Self::FieldNotSet => formatter.write_str("指定された項目は設定されていません。"),
+            Self::InvalidField(field) => write!(
+                formatter,
+                "{} に使用できない文字が含まれているか、UTF-8 ではありません。",
+                field.label()
+            ),
+            Self::FieldTooLong(field) => write!(
+                formatter,
+                "{} が、端末から入力できる上限の {MAX_PASSWORD_LEN} バイトを超えています。",
+                field.label()
+            ),
+            Self::EntryInputAborted => formatter
+                .write_str("入力が途中で終了したため、エントリを保存しませんでした。"),
+            Self::NotesTooLong => write!(
+                formatter,
+                "メモが上限の {MAX_NOTES_LEN} バイトを超えています。"
+            ),
+            Self::NotesEmpty => formatter.write_str("メモの入力が空です。"),
+            Self::DeletionDeclined => formatter
+                .write_str("削除に同意しなかったため、エントリを削除しませんでした。"),
+            Self::ExportDeclined => formatter
+                .write_str("平文の書き出しに同意しなかったため、中止しました。"),
+            Self::ExportDestinationExists => formatter
+                .write_str("書き出し先にファイルがすでに存在するため、中止しました。"),
         }
     }
 }
@@ -344,6 +407,7 @@ mod tests {
     use fidelogic_core::{CryptoError, PrecisError, SystemError, TlvParseError, VaultError};
 
     use super::{AUTHENTICATION_FAILED_MESSAGE, CliError};
+    use crate::entry_ops::EntryField;
     use crate::exit::ExitCategory;
     use crate::password::PasswordError;
     use crate::recovery_code::RecoveryCodeError;
@@ -461,7 +525,19 @@ mod tests {
                 step: HardeningStep::Umask,
                 errno: 1,
             }),
-            CliError::NotImplemented("init"),
+            CliError::EntryNotFound,
+            CliError::EntryAmbiguous,
+            CliError::InvalidEntryName,
+            CliError::MalformedEntry,
+            CliError::FieldNotSet,
+            CliError::InvalidField(EntryField::Username),
+            CliError::FieldTooLong(EntryField::Notes),
+            CliError::EntryInputAborted,
+            CliError::NotesTooLong,
+            CliError::NotesEmpty,
+            CliError::DeletionDeclined,
+            CliError::ExportDeclined,
+            CliError::ExportDestinationExists,
             CliError::AuthenticationFailed,
             CliError::RollbackDetected,
             CliError::InvalidState,
@@ -632,15 +708,17 @@ mod tests {
         assert_eq!(error.exit_category(), ExitCategory::Failure);
     }
 
+    /// 項目の値の誤りは、項目の名称を示すこと。
     #[test]
-    fn test_not_implemented_message_names_subcommand() {
-        assert_eq!(
-            CliError::NotImplemented("rotate-key").to_string(),
-            "サブコマンド `rotate-key` はまだ実装されていません。"
-        );
-        assert_eq!(
-            CliError::NotImplemented("rotate-key").exit_category(),
-            ExitCategory::Failure
-        );
+    fn test_field_errors_name_the_field() {
+        for field in EntryField::ALL {
+            for error in [CliError::InvalidField(field), CliError::FieldTooLong(field)] {
+                assert!(
+                    error.to_string().starts_with(field.label()),
+                    "{error:?} の項目の表示の確認に失敗。"
+                );
+                assert_eq!(error.exit_category(), ExitCategory::Failure);
+            }
+        }
     }
 }

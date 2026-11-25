@@ -1,7 +1,7 @@
 //! # 利用者とのやり取り (`interaction`)
 //!
-//! 複数のサブコマンドが使う、新しいパスワードの入力、リカバリーキットの表示と控えの確認、
-//! 書き出した HTML の後始末、警告と結果の出力を置く。
+//! 複数のサブコマンドが使う、パスワードの入力、同意の確認、リカバリーキットの表示と控えの確認、
+//! 書き出した HTML の後始末、中断できる結果の出力、警告と結果の出力を置く。
 //! このモジュールは OS に依存しない。端末とファイルの操作は [`crate::sys`] が行う。
 //! 端末の表示の限界は、[`crate::init`] の説明を参照する。
 
@@ -72,6 +72,105 @@ pub(crate) fn read_canonical_password(
 ) -> Result<SecretVec, CliError> {
     let input = read_password(source, prompt, watcher)?;
     Ok(canonicalize_password(input.as_bytes())?)
+}
+
+/// 秘密の出力に使う、中断で書き込みをやめる書き込み先。
+///
+/// 中断のシグナルは記録するだけにするため、読み手が止まった出力先への書き込みは、既定では再試行され続ける。
+/// この型は、中断を記録した後の書き込みと、中断で戻った書き込みを、再試行されない失敗にする。
+/// 確認と書き込みの開始の間にシグナルを受けた場合は、書き込みが戻るか、次のシグナルを受けるまで待つ。
+/// 内部のバッファは持たない。
+pub(crate) struct InterruptibleWriter<'a, W, F> {
+    inner: &'a mut W,
+    is_interrupted: F,
+}
+
+impl<'a, W: Write, F: Fn() -> bool> InterruptibleWriter<'a, W, F> {
+    /// `inner` へ書く値を作る。`is_interrupted` は、中断のシグナルを受けたかを返す。
+    pub(crate) fn new(inner: &'a mut W, is_interrupted: F) -> Self {
+        Self {
+            inner,
+            is_interrupted,
+        }
+    }
+}
+
+impl<W: Write, F: Fn() -> bool> Write for InterruptibleWriter<'_, W, F> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if (self.is_interrupted)() {
+            return Err(interrupted_output());
+        }
+        match self.inner.write(buffer) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted && (self.is_interrupted)() =>
+            {
+                Err(interrupted_output())
+            }
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// 中断で書き込みをやめたことを表す失敗。`write_all` が再試行しない種類にする。
+fn interrupted_output() -> std::io::Error {
+    std::io::Error::other("中断のシグナルを受けたため、出力をやめました。")
+}
+
+/// 秘密を含みうる結果を、中断できる形で書き出す。
+///
+/// # Args
+///
+/// - `stdout`: 書き込み先。
+/// - `is_interrupted`: 中断のシグナルを受けたかを返す処理。
+/// - `write`: 内容を書く処理。
+///
+/// # Errors
+///
+/// 中断のシグナルを受けた場合は [`CliError::Interrupted`]、それ以外の書き込みの失敗は [`CliError::OutputFailed`]。
+pub(crate) fn write_output<W: Write>(
+    stdout: &mut W,
+    is_interrupted: &dyn Fn() -> bool,
+    write: impl FnOnce(&mut &mut dyn Write) -> std::io::Result<()>,
+) -> Result<(), CliError> {
+    let mut guarded = InterruptibleWriter::new(stdout, is_interrupted);
+    let mut out: &mut dyn Write = &mut guarded;
+    write(&mut out).and_then(|()| out.flush()).map_err(|_| {
+        if is_interrupted() {
+            CliError::Interrupted
+        } else {
+            CliError::OutputFailed
+        }
+    })
+}
+
+/// 端末で同意を求める。`y` または `yes` (大文字と小文字を区別しない) を同意とする。
+///
+/// 応答は秘密ではないが、読み込みの手順は端末からのパスワードの入力と同じで、表示しない。
+///
+/// # Returns
+///
+/// 同意した場合は `true`。空の応答、他の応答、入力の終端は `false`。
+///
+/// # Errors
+///
+/// 中断のシグナルを受けた場合と、端末を使えない場合は [`CliError::SecretInput`]。
+pub(crate) fn ask_consent(prompt: &str, watcher: &InterruptWatcher) -> Result<bool, CliError> {
+    match read_password(&PasswordSource::Terminal, prompt, watcher) {
+        Ok(answer) => Ok(is_consent(answer.as_bytes())),
+        Err(SecretInputError::Empty | SecretInputError::TooLong | SecretInputError::EndOfInput) => {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// 応答が同意かを返す。
+fn is_consent(answer: &[u8]) -> bool {
+    answer.eq_ignore_ascii_case(b"y") || answer.eq_ignore_ascii_case(b"yes")
 }
 
 /// 中断のシグナルを受けていた場合は失敗する。
@@ -249,10 +348,119 @@ pub(crate) fn report_kit(stdout: &mut impl Write, kit_html: Option<&Path>) -> st
 mod tests {
     use std::error::Error;
 
-    use super::warn_if_directory_not_synced;
+    use std::cell::Cell;
+    use std::io::{self, Write};
+
+    use super::{InterruptibleWriter, is_consent, warn_if_directory_not_synced, write_output};
+    use crate::error::CliError;
     use crate::sys::storage::DirectorySync;
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    /// 指定した回数だけ `EINTR` を返してから、書き込みを受け付ける出力先。
+    /// `EINTR` を返すときに、`interrupts` が真であれば中断を記録する。
+    struct Flaky<'a> {
+        failures: usize,
+        interrupts: bool,
+        interrupted: &'a Cell<bool>,
+        written: Vec<u8>,
+    }
+
+    impl Write for Flaky<'_> {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.failures > 0 {
+                self.failures -= 1;
+                if self.interrupts {
+                    self.interrupted.set(true);
+                }
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.written.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 中断の有無と `EINTR` の組ごとに、`write_all` の結果と、書き込んだ内容を返す。
+    fn write_through(
+        interrupted_before: bool,
+        failures: usize,
+        interrupts: bool,
+    ) -> (io::Result<()>, Vec<u8>) {
+        let interrupted = Cell::new(interrupted_before);
+        let mut sink = Flaky {
+            failures,
+            interrupts,
+            interrupted: &interrupted,
+            written: Vec::new(),
+        };
+        let result = InterruptibleWriter::new(&mut sink, || interrupted.get()).write_all(b"secret");
+        (result, sink.written)
+    }
+
+    #[test]
+    fn test_interruptible_writer_retries_unrelated_interrupts() -> TestResult {
+        for failures in [0, 3] {
+            let (result, written) = write_through(false, failures, false);
+            result?;
+            assert_eq!(written, b"secret", "{failures} 回の再試行に失敗。");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_interruptible_writer_stops_after_an_interrupt() {
+        for (name, before, failures, interrupts) in [
+            ("書き込みの前に中断", true, 0, false),
+            ("書き込み中に中断", false, 1, true),
+        ] {
+            let (result, written) = write_through(before, failures, interrupts);
+            let kind = result.map_err(|error| error.kind());
+            assert!(
+                matches!(kind, Err(kind) if kind != io::ErrorKind::Interrupted),
+                "{name}の中止に失敗: {kind:?}"
+            );
+            assert!(written.is_empty(), "{name}の後に書かないことの確認に失敗。");
+        }
+    }
+
+    #[test]
+    fn test_consent_accepts_only_yes() {
+        for answer in [&b"y"[..], b"Y", b"yes", b"YES", b"Yes"] {
+            assert!(is_consent(answer), "{answer:?} の受理に失敗。");
+        }
+        for answer in [
+            &b""[..],
+            b"n",
+            b"no",
+            b"yy",
+            b"ye",
+            b" y",
+            b"y ",
+            "ｙ".as_bytes(),
+        ] {
+            assert!(!is_consent(answer), "{answer:?} の拒否に失敗。");
+        }
+    }
+
+    #[test]
+    fn test_write_output_distinguishes_interrupt_from_failure() {
+        let mut stdout = Vec::new();
+        let written = write_output(&mut stdout, &|| false, |out| out.write_all(b"value"));
+        assert_eq!(written, Ok(()));
+        assert_eq!(stdout, b"value");
+
+        let failed = write_output(&mut Vec::new(), &|| false, |_| {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        });
+        assert_eq!(failed, Err(CliError::OutputFailed));
+
+        let interrupted = write_output(&mut Vec::new(), &|| true, |out| out.write_all(b"value"));
+        assert_eq!(interrupted, Err(CliError::Interrupted));
+    }
 
     #[test]
     fn test_directory_sync_failure_is_warned_in_one_line() -> TestResult {

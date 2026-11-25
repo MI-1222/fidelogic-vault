@@ -6,8 +6,10 @@
 //! ## 担う処理
 //!
 //! - 制御端末 ([`Terminal`])。標準入力ではなく `/dev/tty` を開き、エコーと行入力モードを止めて読み込む ([`HiddenInput`])。
-//! - 非対話の入力元 ([`InputStream`])。引き継いだファイル記述子と、権限を検査したパスワードファイル。
-//! - 入出力の中断。入力の読み込みと端末への書き込みは、[`InterruptWatcher`] と合わせて待機する。
+//! - 非対話の入力元 ([`InputStream`])。引き継いだファイル記述子、権限を検査したパスワードファイル、メモのファイル。
+//! - 対話モードのコマンドの入力元 ([`InputStream::commands`])。
+//! - 入出力の中断と無操作の上限。入力の読み込みと端末への書き込みは、[`InterruptWatcher`] と合わせて待機する。
+//! - バッファを持たない標準出力 ([`standard_output`])。
 //!
 //! ## 行入力モードを止める理由
 //!
@@ -35,9 +37,9 @@
 #![allow(unsafe_code)]
 
 use core::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -60,6 +62,8 @@ pub enum TtyStep {
     WriteTerminal,
     /// パスワードファイルを開く処理と、属性の確認。
     OpenPasswordFile,
+    /// メモのファイルを開く処理と、属性の確認。
+    OpenNotesFile,
     /// 引き継いだファイル記述子の確認。
     InspectDescriptor,
     /// 入力の読み込み。
@@ -74,6 +78,7 @@ impl TtyStep {
             Self::WriteAttributes => "端末属性の変更",
             Self::WriteTerminal => "端末への書き込み",
             Self::OpenPasswordFile => "パスワードファイルを開く処理",
+            Self::OpenNotesFile => "メモのファイルを開く処理",
             Self::InspectDescriptor => "ファイル記述子の確認",
             Self::Read => "入力の読み込み",
         }
@@ -102,6 +107,10 @@ pub enum TtyError {
     PasswordFileNotRegular,
     /// パスワードファイルに、グループまたは他者の権限がある。
     PasswordFilePermissions,
+    /// メモのファイルが通常のファイルではない。
+    NotesFileNotRegular,
+    /// 無操作の時間が、設定した上限に達した。
+    IdleTimeout,
     /// OS の API の呼び出しが失敗した。
     Os {
         /// 失敗した手順。
@@ -149,6 +158,10 @@ impl fmt::Display for TtyError {
             Self::PasswordFilePermissions => f.write_str(
                 "パスワードファイルにグループまたは他者の権限があります。権限を `0600` にしてください。",
             ),
+            Self::NotesFileNotRegular => {
+                f.write_str("メモのファイルが通常のファイルではありません。")
+            }
+            Self::IdleTimeout => f.write_str("無操作の時間が上限に達しました。"),
             Self::Os { step, errno } => {
                 write!(f, "{}に失敗しました (errno: {errno})。", step.label())
             }
@@ -192,8 +205,10 @@ fn read_descriptor(
         let wakeup = watcher
             .wait(descriptor, Interest::Readable)
             .map_err(|error| TtyError::os(TtyStep::Read, &error))?;
-        if wakeup == Wakeup::Interrupted {
-            return Ok(ReadOutcome::Interrupted);
+        match wakeup {
+            Wakeup::Ready => {}
+            Wakeup::Interrupted => return Ok(ReadOutcome::Interrupted),
+            Wakeup::TimedOut => return Err(TtyError::IdleTimeout),
         }
         // 秘密を中間バッファに置かないよう、呼び出し側の領域へ直接読み込む。
         // SAFETY: `buffer` は `buffer.len()` バイトの書き込み可能な領域であり、呼び出しの間は生存している。
@@ -238,10 +253,12 @@ enum Source {
     Inherited(RawFd),
 }
 
-/// 非対話の入力元。
+/// 非対話の入力元と、対話モードのコマンドの入力元。
 #[derive(Debug)]
 pub struct InputStream {
     source: Source,
+    /// 端末を指すコマンドの入力元か。切断の読み込みの失敗を、入力の終端にそろえる。
+    is_terminal: bool,
 }
 
 impl InputStream {
@@ -274,6 +291,46 @@ impl InputStream {
         }
         Ok(Self {
             source: Source::Inherited(descriptor),
+            is_terminal: false,
+        })
+    }
+
+    /// 標準入力を、対話モードのコマンドの入力元にする。秘密の入力ではないため、端末も受け付ける。
+    ///
+    /// 端末は行入力モードのまま読むため、入力はエコーされ、改行ごとに届く。記述子は閉じない。
+    ///
+    /// # Errors
+    ///
+    /// 標準入力が開いていない場合は [`TtyError::Os`]。
+    pub fn commands() -> Result<Self, TtyError> {
+        let descriptor = libc::STDIN_FILENO;
+        // SAFETY: `F_GETFD` は整数引数だけを取り、記述子の属性を読み取る。
+        if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } < 0 {
+            return Err(TtyError::last_os(TtyStep::InspectDescriptor));
+        }
+        // SAFETY: `isatty` は整数引数だけを取る。
+        let is_terminal = unsafe { libc::isatty(descriptor) } == 1;
+        Ok(Self {
+            source: Source::Inherited(descriptor),
+            is_terminal,
+        })
+    }
+
+    /// メモを読み込むファイルを開く。シンボリックリンクは参照先を開く。権限は検査しない。
+    ///
+    /// # Errors
+    ///
+    /// - 開けない場合と、属性を取得できない場合は [`TtyError::Os`]。
+    /// - 通常のファイル以外の場合は [`TtyError::NotesFileNotRegular`]。
+    ///   FIFO は `O_NONBLOCK` で開くため、書き込み側を待たずに失敗する。
+    pub fn notes_file(path: &Path) -> Result<Self, TtyError> {
+        let (file, metadata) = open_input_file(path, TtyStep::OpenNotesFile)?;
+        if !metadata.is_file() {
+            return Err(TtyError::NotesFileNotRegular);
+        }
+        Ok(Self {
+            source: Source::Owned(file),
+            is_terminal: false,
         })
     }
 
@@ -289,13 +346,7 @@ impl InputStream {
     ///   FIFO は `O_NONBLOCK` で開くため、書き込み側を待たずに失敗する。
     /// - グループまたは他者の権限がある場合は [`TtyError::PasswordFilePermissions`]。
     pub fn password_file(path: &Path) -> Result<Self, TtyError> {
-        let open_error = |error: io::Error| TtyError::os(TtyStep::OpenPasswordFile, &error);
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(path)
-            .map_err(open_error)?;
-        let metadata = file.metadata().map_err(open_error)?;
+        let (file, metadata) = open_input_file(path, TtyStep::OpenPasswordFile)?;
         if !metadata.is_file() {
             return Err(TtyError::PasswordFileNotRegular);
         }
@@ -304,6 +355,7 @@ impl InputStream {
         }
         Ok(Self {
             source: Source::Owned(file),
+            is_terminal: false,
         })
     }
 
@@ -315,7 +367,7 @@ impl InputStream {
     ///
     /// # Errors
     ///
-    /// 待機または読み込みに失敗した場合は [`TtyError::Os`]。
+    /// 待機または読み込みに失敗した場合は [`TtyError::Os`]、無操作の上限に達した場合は [`TtyError::IdleTimeout`]。
     pub fn read(
         &mut self,
         buffer: &mut [u8],
@@ -325,8 +377,37 @@ impl InputStream {
             Source::Owned(file) => file.as_raw_fd(),
             Source::Inherited(descriptor) => *descriptor,
         };
-        read_descriptor(descriptor, buffer, watcher)
+        let result = read_descriptor(descriptor, buffer, watcher);
+        if self.is_terminal {
+            end_of_input_on_hangup(result)
+        } else {
+            result
+        }
     }
+}
+
+/// 入力元のファイルを、待たずに開いて属性を取得する。
+fn open_input_file(path: &Path, step: TtyStep) -> Result<(File, Metadata), TtyError> {
+    let open_error = |error: io::Error| TtyError::os(step, &error);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .map_err(open_error)?;
+    let metadata = file.metadata().map_err(open_error)?;
+    Ok((file, metadata))
+}
+
+/// 標準出力を、内部のバッファを持たないファイルとして返す。
+///
+/// 標準ライブラリの標準出力はバッファを消去しないため、秘密の項目を書くときに複写が残る。
+/// 返すのは記述子の複製で、閉じても標準出力は閉じない。
+///
+/// # Errors
+///
+/// 記述子を複製できない場合。
+pub fn standard_output() -> io::Result<File> {
+    io::stdout().as_fd().try_clone_to_owned().map(File::from)
 }
 
 /// 制御端末。
@@ -364,7 +445,7 @@ impl Terminal {
     ///
     /// # Errors
     ///
-    /// 書き込みに失敗した場合は [`TtyError::Os`]。
+    /// 書き込みに失敗した場合は [`TtyError::Os`]、無操作の上限に達した場合は [`TtyError::IdleTimeout`]。
     pub fn write(&self, text: &str, watcher: &InterruptWatcher) -> Result<bool, TtyError> {
         let write_error = |error: io::Error| TtyError::os(TtyStep::WriteTerminal, &error);
         let mut remaining = text.as_bytes();
@@ -372,8 +453,10 @@ impl Terminal {
             let wakeup = watcher
                 .wait(self.device.as_raw_fd(), Interest::Writable)
                 .map_err(write_error)?;
-            if wakeup == Wakeup::Interrupted {
-                return Ok(false);
+            match wakeup {
+                Wakeup::Ready => {}
+                Wakeup::Interrupted => return Ok(false),
+                Wakeup::TimedOut => return Err(TtyError::IdleTimeout),
             }
             match self.write_once(remaining) {
                 Ok(written) => remaining = remaining.get(written..).unwrap_or_default(),
