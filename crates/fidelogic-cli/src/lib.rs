@@ -7,13 +7,12 @@
 //! 本ツールは、ファイルシステム上に永続化された暗号化ストレージ (Vault) の作成、スロット構成の更新
 //! (Argon2id パスワード、WebAuthn PRF 鍵、リカバリーコード)、機密エントリの安全な格納・抽出を
 //! コマンドラインから実行するための管理者向けインターフェースを目指している。
-//! 現時点で実装済みなのは、プロセス硬化、引数の解析 ([`args`])、エラー出力と終了コードの規約 ([`error`], [`exit`])、
-//! Vault のパスの正規化・排他ロック・アトミックな保存 ([`sys::storage`])、世代を検証する読み込みと保存 ([`vault_file`])、
-//! パスワードの入力 ([`secret_input`])、クリップボードへのコピーと自動消去 ([`sys::clipboard`])、
-//! リカバリーコードの生成と検証 ([`recovery_code`]) である。
-//! サブコマンドは解析まで行い、実行すると「未実装」のエラーを返す。
-//! 排他ロック、保存、パスワードの入力、クリップボード、リカバリーコードを使うサブコマンドはまだ無い。
-//! 例外は、クリップボードへのコピーが内部で起動する隠しサブコマンド `__clipboard-worker` で、これは実行できる。
+//! 実行できるサブコマンドは、Vault を作成してリカバリーキットを表示する `init` ([`init`]) と、
+//! クリップボードへのコピーが内部で起動する隠しサブコマンド `__clipboard-worker` である。
+//! 他のサブコマンドは解析まで行い、実行すると「未実装」のエラーを返す。
+//!
+//! エントリの操作、解錠、鍵の更新に使う部品のうち、世代を検証する読み込みと保存 ([`vault_file`])、
+//! クリップボードへのコピーと自動消去 ([`sys::clipboard`]) は実装済みだが、呼び出すサブコマンドはまだ無い。
 //!
 //! 実行ファイル (`main.rs`) は [`run`] を呼ぶだけの薄い入口であり、処理の本体はこのライブラリに置く。
 //! これにより、統合テストから各処理を直接呼び出せる。
@@ -43,26 +42,29 @@
 //! - **プロセス硬化 (実装済み)**: [`run`] は引数の解析より前に [`sys::process::harden_process`] を実行し、
 //!   コアダンプの抑止、`umask(0077)`、デバッガーのアタッチ拒否を適用する。
 //! - **秘密を引数と環境変数で受け取らない (実装済み)**: パスワードなどを値として受け取る引数を設けない ([`args`])。
-//! - **端末と非対話の入力 (実装済み、サブコマンドからは未使用)**: 制御端末ではエコーを止めて読み込み、
+//! - **端末と非対話の入力 (実装済み)**: 制御端末ではエコーを止めて読み込み、
 //!   中断のシグナルを受けた場合は端末属性を戻して秘密を消去する ([`secret_input::read_password`], [`sys::signal`])。
+//!   読み込んだパスワードは、PRECIS の `OpaqueString` プロファイルをコアの実装の範囲で適用してから使う ([`password`])。
 //! - **OS 依存処理の境界**: OS の API の呼び出しと、OS を判別する条件付きコンパイルは [`sys`] の配下に閉じ込める。
 //!   それ以外のモジュールは OS に依存しない。
-//! - **排他制御 (実装済み、サブコマンドからは未使用)**: 名前を変えないサイドカー `<vault>.lock` に排他ロックを掛ける
+//! - **排他制御 (実装済み)**: 名前を変えないサイドカー `<vault>.lock` に排他ロックを掛ける
 //!   ([`sys::storage::VaultLock`])。ロックを取得しないプログラムによる読み書きは防げない。
-//! - **アトミックな保存と世代の二重検証 (実装済み、サブコマンドからは未使用)**: 一時ファイルへの書き込み、永続化、`rename`、
-//!   親ディレクトリの同期の順で保存する ([`sys::storage::write_vault_file_atomically`])。保存の直前にディスク上の Vault を読み直し、
+//! - **アトミックな作成と保存 (実装済み)**: 一時ファイルへの書き込み、永続化、改名、親ディレクトリの同期の順で書く。
+//!   `init` は、既存のファイルを置き換えない改名で作成する ([`sys::storage::create_vault_file_atomically`])。
+//! - **世代の二重検証 (実装済み、サブコマンドからは未使用)**: 保存の直前にディスク上の Vault を読み直し、
 //!   読み込み時と異なれば中止する ([`vault_file::save_vault`])。
 //! - **クリップボード (実装済み、サブコマンドからは未使用)**: 秘密のコピーは、自分自身を起動したワーカープロセスが行い、
 //!   30 秒後に、内容が変わっていなければ消去する。秘密のフィールドは履歴からの除外を指定する ([`sys::clipboard`])。
 //!   除外の指定を無視するクリップボードマネージャーには防御できない。
-//! - **リカバリーコード (実装済み、サブコマンドからは未使用)**: 128 bit の乱数にチェックサムを付けた、30 文字のコードを作る。
-//!   乱数は OS から取得する ([`sys::random::fill_random`])。入力は、誤読しやすい文字を読み替え、
-//!   チェックサムを鍵導出より前に検証する ([`recovery_code::RecoveryCode`])。
+//! - **リカバリーコード (実装済み)**: 128 bit の乱数にチェックサムを付けた、30 文字のコードを作る
+//!   ([`recovery_code::RecoveryCode`])。乱数は OS から取得する ([`sys::random::fill_random`])。
+//!   `init` は端末の代替画面に表示し、末尾の再入力を確認してから Vault を作成する ([`init`], [`recovery_kit`])。
+//!   入力されたコードの読み取り (誤読しやすい文字の読み替えと、チェックサムの検証) を使うサブコマンドはまだ無い。
 //! - **メモリ保護 (一部実装)**: パスワードの入力バッファとリカバリーコードは `fidelogic_core` の `LockedBuffer` に置き、
 //!   `mlock` (スワップアウト抑止) に失敗した場合は処理を中止する。
-//!   鍵を保持するバッファへの適用は、鍵を扱う処理とあわせて追加する。
+//!   DEK、正準化したパスワード、鍵導出の作業領域は `mlock` せず、破棄時に消去する。
 //! - **プロファイル連携**: [`fidelogic_core`] を `profile-vault` でリンクしている。
-//!   暗号処理とゼロ消去はコアが担い、CLI から呼び出す処理は今後追加する。
+//!   暗号処理とゼロ消去はコアが担う。
 //!
 //! ## 対応環境
 //!
@@ -73,7 +75,10 @@
 pub mod args;
 pub mod error;
 pub mod exit;
+pub mod init;
+pub mod password;
 pub mod recovery_code;
+pub mod recovery_kit;
 pub mod secret_input;
 pub mod sys;
 pub mod vault_file;
@@ -85,6 +90,7 @@ use std::process::ExitCode;
 use crate::args::{CommandLine, ParseExit, Subcommand};
 use crate::error::CliError;
 use crate::exit::ExitCategory;
+use crate::init::InitRequest;
 
 /// 標準エラー出力のメッセージの先頭に付けるプログラム名。
 pub const PROGRAM_NAME: &str = "fidelogic-cli";
@@ -131,7 +137,7 @@ pub fn run_with_args(
     stderr: &mut impl Write,
 ) -> ExitCategory {
     match args::parse(args) {
-        Ok(command_line) => match execute(&command_line, stdout) {
+        Ok(command_line) => match execute(&command_line, stdout, stderr) {
             Ok(()) => ExitCategory::Success,
             Err(error) => report_error(stderr, error),
         },
@@ -152,12 +158,25 @@ pub fn run_with_args(
 /// # Errors
 ///
 /// サブコマンドの失敗を [`CliError`] で返す。
-/// 現時点では、内部用の `__clipboard-worker` 以外のすべてのサブコマンドが [`CliError::NotImplemented`] を返す。
-fn execute(command_line: &CommandLine, stdout: &mut impl Write) -> Result<(), CliError> {
-    match command_line.subcommand {
+/// 現時点では、`init` と内部用の `__clipboard-worker` 以外のサブコマンドが [`CliError::NotImplemented`] を返す。
+fn execute(
+    command_line: &CommandLine,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<(), CliError> {
+    match &command_line.subcommand {
+        Subcommand::Init { kit_html } => init::run(
+            InitRequest {
+                vault: command_line.vault.as_deref(),
+                password_source: &command_line.password_source,
+                kit_html: kit_html.as_deref(),
+            },
+            stdout,
+            stderr,
+        ),
         // 応答は、起動した親とつながる標準出力に書く。
         Subcommand::ClipboardWorker { policy } => {
-            sys::clipboard::run_worker(policy, stdout).map_err(CliError::from)
+            sys::clipboard::run_worker(*policy, stdout).map_err(CliError::from)
         }
         _ => Err(CliError::NotImplemented(command_line.subcommand.name())),
     }
@@ -262,6 +281,19 @@ mod tests {
         assert_eq!(
             stderr,
             format!("{PROGRAM_NAME}: サブコマンド `get` はまだ実装されていません。\n")
+        );
+        Ok(())
+    }
+
+    /// `--vault` の指定が無い `init` は、端末やファイルに触れる前に引数の誤りになること。
+    #[test]
+    fn test_init_without_vault_is_a_usage_error() -> TestResult {
+        let (category, stdout, stderr) = run_strs(&["init"])?;
+        assert_eq!(category, ExitCategory::Usage);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            format!("{PROGRAM_NAME}: `--vault <PATH>` で Vault のパスを指定してください。\n")
         );
         Ok(())
     }

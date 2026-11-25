@@ -11,6 +11,8 @@
 //! - Vault ファイルの読み込み ([`read_vault_file`])。
 //! - アトミックな保存 ([`write_vault_file_atomically`])。同じディレクトリの一時ファイルへの書き込み、永続化、
 //!   `rename` による置換、親ディレクトリの同期を順に行う。
+//! - Vault ファイルの新規作成 ([`create_vault_file_atomically`])。手順は保存と同じで、既存のファイルを置き換えない。
+//! - 秘密を含むファイルの新規作成 ([`write_new_private_file`])。権限 `0600` で、既存のファイルを開かない。
 //!
 //! ## 使い方
 //!
@@ -52,6 +54,7 @@
 //! | 排他ロック | `File::lock` (`flock`) | `File::lock` (`LockFileEx`) |
 //! | 永続化 | `File::sync_all`。Apple では `F_FULLFSYNC` となり、仮想ファイルシステムが `ENOTTY` / `ENOTSUP` を返したときだけ `fsync` へ戻す | `FlushFileBuffers` |
 //! | 置換 | `rename` の後に親ディレクトリを同期する | `ReplaceFileW` または `MoveFileExW` |
+//! | 置換しない作成 | `renameat2` の `RENAME_NOREPLACE`、`renameatx_np` の `RENAME_EXCL`、またはハードリンク | `MoveFileExW` (置換の指定なし) |
 //! | 作成時の権限 | `0600` | - |
 
 #![allow(unsafe_code)]
@@ -75,6 +78,9 @@ const LOCK_FILE_MODE: u32 = 0o600;
 
 /// 一時ファイルを作成するときの権限。オーナーの読み書きだけを許す。
 const TEMP_FILE_MODE: u32 = 0o600;
+
+/// [`write_new_private_file`] でファイルを作成するときの権限。オーナーの読み書きだけを許す。
+const PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// 一時ファイルの名前の末尾に付ける接尾辞。
 const TEMP_SUFFIX: &str = ".tmp";
@@ -101,6 +107,14 @@ pub enum StorageStep {
     SyncTempFile,
     /// `rename` による Vault ファイルの置換。
     Rename,
+    /// Vault ファイルの有無の確認。
+    InspectVault,
+    /// 新規の出力先のファイルの作成。
+    CreateNewFile,
+    /// 新規の出力先のファイルへの書き込み。
+    WriteNewFile,
+    /// 新規の出力先のファイルの永続化 (`fsync`)。
+    SyncNewFile,
 }
 
 impl StorageStep {
@@ -115,6 +129,10 @@ impl StorageStep {
             Self::WriteTempFile => "一時ファイルへの書き込み",
             Self::SyncTempFile => "一時ファイルの永続化",
             Self::Rename => "Vault ファイルの置換",
+            Self::InspectVault => "Vault ファイルの確認",
+            Self::CreateNewFile => "出力先のファイルの作成",
+            Self::WriteNewFile => "出力先のファイルへの書き込み",
+            Self::SyncNewFile => "出力先のファイルの永続化",
         }
     }
 }
@@ -136,6 +154,8 @@ pub enum StorageError {
     Locked,
     /// Vault ファイルが、読み込みの上限を超える大きさである。
     VaultTooLarge,
+    /// 新規に作成するパスに、ファイルなどがすでに存在する。
+    AlreadyExists,
     /// OS の API の呼び出しが失敗した。
     Os {
         /// 失敗した手順。
@@ -170,6 +190,7 @@ impl fmt::Display for StorageError {
             }
             Self::Locked => f.write_str("他の処理が Vault を使用中です。"),
             Self::VaultTooLarge => f.write_str("Vault ファイルが読み込める大きさを超えています。"),
+            Self::AlreadyExists => f.write_str("作成先にファイルがすでに存在します。"),
             Self::Os { step, errno } => {
                 write!(f, "{}に失敗しました (errno: {errno})。", step.label())
             }
@@ -391,6 +412,19 @@ impl Drop for VaultLock {
     }
 }
 
+/// Vault のパスに、ファイルなどが存在するかを返す。シンボリックリンクはたどらない。
+///
+/// # Errors
+///
+/// 有無を確認できない (権限が無いなど) 場合は [`StorageError::Os`]。
+pub fn vault_file_exists(lock: &VaultLock) -> Result<bool, StorageError> {
+    match fs::symlink_metadata(lock.vault_path().file()) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StorageError::os(StorageStep::InspectVault, &error)),
+    }
+}
+
 /// Vault ファイルの内容を読み込む。
 ///
 /// ロックの対象である Vault のパス ([`VaultLock::vault_path`]) から読む。
@@ -472,15 +506,108 @@ pub fn write_vault_file_atomically(
     lock: &VaultLock,
     contents: &[u8],
 ) -> Result<DirectorySync, StorageError> {
-    write_atomically_with(lock.vault_path(), contents, sync_file_durably)
+    write_atomically_with(
+        lock.vault_path(),
+        contents,
+        Placement::Replace,
+        sync_file_durably,
+    )
 }
 
-/// [`write_vault_file_atomically`] の本体。永続化の処理 `sync` を差し替えられるようにしてある。
+/// 内容 `contents` の Vault ファイルを、アトミックに新規作成する。既存のファイルは置き換えない。
+///
+/// 手順は [`write_vault_file_atomically`] と同じで、置換の代わりに、パスが空いている場合だけ成功する改名を使う。
+/// ロックを取得しないプログラムがパスにファイルを作っていた場合も、上書きしない。
+///
+/// # Returns
+///
+/// 親ディレクトリの同期の結果。作成までは成功している。
+///
+/// # Errors
+///
+/// - パスにファイルなどがすでに存在する場合は [`StorageError::AlreadyExists`]。
+/// - それ以外の失敗は、失敗した手順を示す [`StorageError::Os`]。
+///
+/// いずれの場合も一時ファイルは削除し、パスにあるものは変更しない。
+pub fn create_vault_file_atomically(
+    lock: &VaultLock,
+    contents: &[u8],
+) -> Result<DirectorySync, StorageError> {
+    write_atomically_with(
+        lock.vault_path(),
+        contents,
+        Placement::CreateNew,
+        sync_file_durably,
+    )
+}
+
+/// 権限 `0600` のファイルを新規に作成し、`write` で内容を書いて永続化する。
+///
+/// `O_CREAT | O_EXCL` で作成するため、既存のファイルを開かず、シンボリックリンクもたどらない。
+/// 内容に秘密を含むファイルを想定し、`write` にはバッファを持たない [`File`] を渡す。
+///
+/// # Args
+///
+/// - `path`: 作成するファイル。親ディレクトリは存在しなければならない。
+/// - `write`: 内容を書き込む処理。
+///
+/// # Returns
+///
+/// 親ディレクトリの同期の結果。ファイルの永続化までは成功している。
+///
+/// # Errors
+///
+/// - パスにファイルなどがすでに存在する場合は [`StorageError::AlreadyExists`]。
+/// - 作成、書き込み、永続化のいずれかに失敗した場合は、失敗した手順を示す [`StorageError::Os`]。
+///   作成した後の失敗では、ファイルを削除する。
+pub fn write_new_private_file<W>(path: &Path, write: W) -> Result<DirectorySync, StorageError>
+where
+    W: FnOnce(&mut File) -> io::Result<()>,
+{
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_FILE_MODE)
+        .open(path)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::AlreadyExists => StorageError::AlreadyExists,
+            _ => StorageError::os(StorageStep::CreateNewFile, &error),
+        })?;
+    let written = write(&mut file)
+        .map_err(|error| StorageError::os(StorageStep::WriteNewFile, &error))
+        .and_then(|()| {
+            sync_file_durably(&file)
+                .map_err(|error| StorageError::os(StorageStep::SyncNewFile, &error))
+        });
+    if let Err(error) = written {
+        // この呼び出しで作成したファイルだけを削除する。削除の失敗は報告せず、元の失敗を返す。
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(sync_directory(directory, &sync_file_durably))
+}
+
+/// 書き込んだ一時ファイルを、Vault のパスに置く方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// 既存の Vault を置き換える。
+    Replace,
+    /// パスが空いている場合だけ置く。
+    CreateNew,
+}
+
+/// [`write_vault_file_atomically`] と [`create_vault_file_atomically`] の本体。
+/// 永続化の処理 `sync` を差し替えられるようにしてある。
 ///
 /// `sync` は、一時ファイルと親ディレクトリの両方の同期に使う。
 fn write_atomically_with<S>(
     path: &VaultPath,
     contents: &[u8],
+    placement: Placement,
     sync: S,
 ) -> Result<DirectorySync, StorageError>
 where
@@ -499,12 +626,22 @@ where
             StorageError::os(StorageStep::SyncTempFile, &error),
         ));
     }
-    // `persist` は `rename` で置き換える。失敗した場合は、一時ファイルが戻り値で返る。
-    temp.persist(path.file()).map_err(|failure| {
-        discard_temp_file(
-            failure.file,
-            StorageError::os(StorageStep::Rename, &failure.error),
-        )
+    // `persist` は `rename` で置き換える。`persist_noclobber` は、置換を拒否する改名
+    // (`RENAME_NOREPLACE`、`RENAME_EXCL`) を使い、使えない場合はハードリンクの作成に切り替える。
+    // どちらも失敗した場合は、一時ファイルが戻り値で返る。
+    let persisted = match placement {
+        Placement::Replace => temp.persist(path.file()),
+        Placement::CreateNew => temp.persist_noclobber(path.file()),
+    };
+    persisted.map_err(|failure| {
+        let error = if placement == Placement::CreateNew
+            && failure.error.kind() == io::ErrorKind::AlreadyExists
+        {
+            StorageError::AlreadyExists
+        } else {
+            StorageError::os(StorageStep::Rename, &failure.error)
+        };
+        discard_temp_file(failure.file, error)
     })?;
     Ok(sync_directory(path.directory(), &sync))
 }
@@ -616,16 +753,18 @@ mod tests {
     use std::error::Error;
     use std::ffi::OsStr;
     use std::fs::{self, File};
-    use std::io;
+    use std::io::{self, Write};
     use std::os::fd::OwnedFd;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DirectorySync, StorageError, StorageStep, VaultLock, VaultPath, final_file_name,
-        has_lock_suffix, is_full_fsync_unsupported, plain_fsync, sync_directory,
-        sync_with_fallback, write_atomically_with,
+        DirectorySync, Placement, StorageError, StorageStep, VaultLock, VaultPath,
+        create_vault_file_atomically, final_file_name, has_lock_suffix, is_full_fsync_unsupported,
+        plain_fsync, sync_directory, sync_with_fallback, vault_file_exists, write_atomically_with,
+        write_new_private_file,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -724,9 +863,10 @@ mod tests {
         let path = VaultPath::resolve(&dir.0.join("vault.fvl"))?;
 
         for errno in [libc::EIO, libc::ENOSPC] {
-            let error = write_atomically_with(&path, b"new", failing_sync(errno))
-                .err()
-                .ok_or("同期の失敗を成功として扱ったため失敗しました。")?;
+            let error =
+                write_atomically_with(&path, b"new", Placement::Replace, failing_sync(errno))
+                    .err()
+                    .ok_or("同期の失敗を成功として扱ったため失敗しました。")?;
             assert_eq!(
                 error,
                 StorageError::Os {
@@ -754,7 +894,7 @@ mod tests {
             }
         };
 
-        let outcome = write_atomically_with(&path, b"new", sync)?;
+        let outcome = write_atomically_with(&path, b"new", Placement::Replace, sync)?;
         assert_eq!(outcome, DirectorySync::Failed { errno: libc::EIO });
         assert_eq!(synced_files.get(), 1, "一時ファイルの同期の確認に失敗。");
         assert_eq!(fs::read(path.file())?, b"new");
@@ -816,6 +956,7 @@ mod tests {
             StorageError::LockFileNotRegularFile,
             StorageError::Locked,
             StorageError::VaultTooLarge,
+            StorageError::AlreadyExists,
         ]
         .into_iter()
         .chain(
@@ -828,6 +969,10 @@ mod tests {
                 StorageStep::WriteTempFile,
                 StorageStep::SyncTempFile,
                 StorageStep::Rename,
+                StorageStep::InspectVault,
+                StorageStep::CreateNewFile,
+                StorageStep::WriteNewFile,
+                StorageStep::SyncNewFile,
             ]
             .map(|step| StorageError::Os { step, errno: 5 }),
         );
@@ -873,6 +1018,136 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// 一時ディレクトリの Vault のロックを取得する。
+    fn lock_in(dir: &TempDir) -> Result<VaultLock, Box<dyn Error>> {
+        let path = VaultPath::resolve(&dir.0.join("vault.fvl"))?;
+        Ok(VaultLock::try_acquire(path)?)
+    }
+
+    /// パスの権限のビットを返す。
+    fn mode_of(path: &Path) -> Result<u32, Box<dyn Error>> {
+        Ok(fs::symlink_metadata(path)?.permissions().mode() & 0o7777)
+    }
+
+    #[test]
+    fn test_create_vault_file_writes_new_file_with_owner_only_mode() -> TestResult {
+        let dir = TempDir::new()?;
+        let lock = lock_in(&dir)?;
+        assert!(!vault_file_exists(&lock)?, "作成前の有無の確認に失敗。");
+
+        assert_eq!(
+            create_vault_file_atomically(&lock, b"created")?,
+            DirectorySync::Synced
+        );
+        let file = lock.vault_path().file();
+        assert!(vault_file_exists(&lock)?, "作成後の有無の確認に失敗。");
+        assert_eq!(fs::read(file)?, b"created");
+        assert_eq!(mode_of(file)?, 0o600);
+        assert_eq!(entry_names(&dir.0)?, ["vault.fvl", "vault.fvl.lock"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_vault_file_does_not_replace_existing_entry() -> TestResult {
+        let dir = TempDir::new()?;
+        // ロックの取得後に、ロックに従わない処理がファイルを作った場合にあたる。
+        let lock = lock_in(&dir)?;
+        let file = lock.vault_path().file().to_path_buf();
+        fs::write(&file, b"existing")?;
+        assert_eq!(
+            create_vault_file_atomically(&lock, b"created"),
+            Err(StorageError::AlreadyExists)
+        );
+        assert_eq!(fs::read(&file)?, b"existing", "既存の内容の維持に失敗。");
+        assert_eq!(entry_names(&dir.0)?, ["vault.fvl", "vault.fvl.lock"]);
+
+        // 参照先の無いシンボリックリンクも置き換えない。
+        fs::remove_file(&file)?;
+        std::os::unix::fs::symlink(dir.0.join("missing"), &file)?;
+        assert!(vault_file_exists(&lock)?, "リンクの有無の確認に失敗。");
+        assert_eq!(
+            create_vault_file_atomically(&lock, b"created"),
+            Err(StorageError::AlreadyExists)
+        );
+        assert!(fs::symlink_metadata(&file)?.file_type().is_symlink());
+        assert_eq!(entry_names(&dir.0)?, ["vault.fvl", "vault.fvl.lock"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_private_file_is_created_with_owner_only_mode() -> TestResult {
+        let dir = TempDir::new()?;
+        let path = dir.0.join("kit.html");
+        let outcome = write_new_private_file(&path, |file| {
+            file.write_all(b"first ")?;
+            file.write_all(b"second")
+        })?;
+        assert_eq!(outcome, DirectorySync::Synced);
+        assert_eq!(fs::read(&path)?, b"first second");
+        assert_eq!(mode_of(&path)?, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_private_file_does_not_open_existing_entry() -> TestResult {
+        let dir = TempDir::new()?;
+        let existing = dir.0.join("kit.html");
+        fs::write(&existing, b"existing")?;
+        let target = dir.0.join("target");
+        let link = dir.0.join("link.html");
+        std::os::unix::fs::symlink(&target, &link)?;
+        for path in [&existing, &link, &dir.0] {
+            assert_eq!(
+                write_new_private_file(path, |file| file.write_all(b"new")),
+                Err(StorageError::AlreadyExists),
+                "{} の拒否に失敗。",
+                path.display()
+            );
+        }
+        assert_eq!(fs::read(&existing)?, b"existing");
+        assert!(
+            !target.exists(),
+            "リンクの参照先を作らないことの確認に失敗。"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_private_file_is_removed_when_writing_fails() -> TestResult {
+        let dir = TempDir::new()?;
+        let path = dir.0.join("kit.html");
+        let result = write_new_private_file(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        });
+        assert_eq!(
+            result,
+            Err(StorageError::Os {
+                step: StorageStep::WriteNewFile,
+                errno: libc::ENOSPC,
+            })
+        );
+        assert!(
+            entry_names(&dir.0)?.is_empty(),
+            "途中のファイルの削除に失敗。"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_private_file_reports_missing_directory() -> TestResult {
+        let dir = TempDir::new()?;
+        let path = dir.0.join("missing").join("kit.html");
+        assert_eq!(
+            write_new_private_file(&path, |_| Ok(())),
+            Err(StorageError::Os {
+                step: StorageStep::CreateNewFile,
+                errno: libc::ENOENT,
+            })
+        );
+        Ok(())
     }
 
     /// 記述子の複製が残っていても、値の破棄でロックが解放されること。

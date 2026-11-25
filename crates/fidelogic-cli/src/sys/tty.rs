@@ -389,12 +389,30 @@ impl Terminal {
         Ok(true)
     }
 
-    /// 端末で改行する。入力の後始末に使い、中断されていても 1 回だけ試みる。
+    /// 端末で改行する。入力の後始末に使い、中断されていても試みる。
     ///
     /// 待たずに戻るため、出力が停止した端末では改行されないことがある。
     /// 失敗しても入力の結果は変わらないため、結果を返さない。
     pub fn end_line(&self) {
-        let _ = self.write_once(b"\n");
+        self.write_without_waiting("\n");
+    }
+
+    /// 端末に `text` を、待たずに書けるところまで書く。画面の後始末に使い、中断されていても試みる。
+    ///
+    /// 出力が停止した端末などで書き込めない場合は、残りを捨てて戻る。
+    /// 呼び出し側の結果は変わらないため、結果を返さない。
+    pub fn write_without_waiting(&self, text: &str) {
+        let mut remaining = text.as_bytes();
+        while !remaining.is_empty() {
+            match self.write_once(remaining) {
+                Ok(written) if written > 0 => {
+                    remaining = remaining.get(written..).unwrap_or_default();
+                }
+                // 書き込みは待たないため、中断された場合はすぐにやり直す。
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                _ => break,
+            }
+        }
     }
 
     /// `write` を 1 回呼ぶ。`EINTR` を再試行しない。

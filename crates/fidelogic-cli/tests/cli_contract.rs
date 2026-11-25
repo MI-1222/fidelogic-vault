@@ -1,7 +1,7 @@
 //! 実行ファイルの終了コードと出力の規約を、子プロセスとして起動して確かめる統合テスト。
 //!
 //! - 成功 (`--help`, `--version`) は終了コード 0 で標準出力に書く。
-//! - 引数の誤りは終了コード 2 で、標準エラー出力に `fidelogic-cli: ` で始まる 1 行を書く。
+//! - 引数の誤り (必須の `--vault` の指定漏れを含む) は終了コード 2 で、標準エラー出力に `fidelogic-cli: ` で始まる 1 行を書く。
 //! - 未実装のサブコマンドは終了コード 1 で、標準エラー出力にサブコマンド名を含む 1 行を書く。
 //! - 秘密を環境変数から読む経路 (`bpaf` の環境変数からの既定値) が `src/` に無い。
 
@@ -10,8 +10,8 @@ use std::process::{Command, Output};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const SUBCOMMAND_INVOCATIONS: [&[&str]; 9] = [
-    &["init"],
+/// 本体が未実装のサブコマンドの起動。`init` の振る舞いは `tests/init.rs` で確かめる。
+const UNIMPLEMENTED_INVOCATIONS: [&[&str]; 8] = [
     &["unlock"],
     &["list"],
     &["get", "github"],
@@ -61,10 +61,11 @@ fn test_help_and_version_exit_with_zero() -> TestResult {
 
 #[test]
 fn test_invalid_arguments_exit_with_two() -> TestResult {
-    let invalid: [&[&str]; 5] = [
+    let invalid: [&[&str]; 6] = [
         &[],
         &["open"],
         &["get"],
+        &["init"],
         &["init", "--password", "hunter2"],
         &["rotate-key", "--kek-only", "--full-dek"],
     ];
@@ -92,7 +93,7 @@ fn test_invalid_arguments_exit_with_two() -> TestResult {
 
 #[test]
 fn test_unimplemented_subcommands_exit_with_one() -> TestResult {
-    for args in SUBCOMMAND_INVOCATIONS {
+    for args in UNIMPLEMENTED_INVOCATIONS {
         let output = run_binary(args)?;
         let stderr = String::from_utf8(output.stderr.clone())?;
         assert_eq!(

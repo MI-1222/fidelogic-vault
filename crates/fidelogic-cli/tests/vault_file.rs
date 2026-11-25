@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fidelogic_cli::sys::storage::{
-    DirectorySync, StorageError, StorageStep, VaultLock, VaultPath, read_vault_file,
-    write_vault_file_atomically,
+    DirectorySync, StorageError, StorageStep, VaultLock, VaultPath, create_vault_file_atomically,
+    read_vault_file, write_new_private_file, write_vault_file_atomically,
 };
 use fidelogic_cli::vault_file::{LoadedVault, VaultFileError, save_vault};
 use fidelogic_core::{
@@ -28,6 +28,10 @@ type TestResult = Result<(), Box<dyn Error>>;
 const CHILD_VAULT: &str = "FIDELOGIC_CLI_SAVE_CHILD_VAULT";
 /// 子プロセスが書き込みを終えたことを示す出力。
 const MARKER_WRITTEN: &str = "save-child:written";
+/// 子プロセスに、新規に作成させる Vault のパスを渡す環境変数の名前。
+const CHILD_CREATED_VAULT: &str = "FIDELOGIC_CLI_CREATE_CHILD_VAULT";
+/// 子プロセスが新規の作成を終えたことを示す出力。
+const MARKER_CREATED: &str = "save-child:created";
 /// 子プロセスに、書き込みの失敗を確認させる Vault のパスを渡す環境変数の名前。
 const CHILD_LIMITED_VAULT: &str = "FIDELOGIC_CLI_SAVE_CHILD_LIMITED_VAULT";
 /// 子プロセスで書き込みが失敗したことを確認できたことを示す出力。
@@ -654,6 +658,56 @@ fn test_atomic_write_creates_owner_only_file_regardless_of_umask() -> TestResult
         "Vault ファイルの権限が 0600 でないため失敗しました。"
     );
     assert_eq!(dir.names()?, ["vault.fvl", "vault.fvl.lock"]);
+    Ok(())
+}
+
+/// 子プロセスの中で、Vault と秘密を含むファイルを新規に作成する本体。環境変数が無い通常実行では何もしない。
+#[test]
+fn child_create_action() -> TestResult {
+    let Some(vault) = std::env::var_os(CHILD_CREATED_VAULT) else {
+        return Ok(());
+    };
+    let vault = PathBuf::from(vault);
+    let lock = VaultLock::acquire(VaultPath::resolve(&vault)?)?;
+    assert_eq!(
+        create_vault_file_atomically(&lock, b"created-by-child")?,
+        DirectorySync::Synced
+    );
+    assert_eq!(
+        write_new_private_file(&vault.with_extension("html"), |file| {
+            std::io::Write::write_all(file, b"private")
+        })?,
+        DirectorySync::Synced
+    );
+    println!("{MARKER_CREATED}");
+    Ok(())
+}
+
+#[test]
+fn test_new_files_are_owner_only_regardless_of_umask() -> TestResult {
+    let dir = TempDir::new()?;
+    let vault = dir.join("vault.fvl");
+
+    // `umask` に頼らず権限を指定していることを確認するため、子の `umask` を 0 にする。
+    let mut command = child_command("child_create_action", CHILD_CREATED_VAULT, &vault)?;
+    // SAFETY: `pre_exec` のクロージャーは `fork` 後の子プロセスで実行される。
+    // `umask` は非同期シグナルセーフであり、ヒープ確保などの安全でない処理は行わない。
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0);
+            Ok(())
+        });
+    }
+    assert_child_output(command, MARKER_CREATED)?;
+
+    for name in ["vault.fvl", "vault.html"] {
+        assert_eq!(
+            fs::metadata(dir.join(name))?.mode() & 0o7777,
+            0o600,
+            "{name} の権限が 0600 でないため失敗しました。"
+        );
+    }
+    assert_eq!(dir.names()?, ["vault.fvl", "vault.fvl.lock", "vault.html"]);
     Ok(())
 }
 

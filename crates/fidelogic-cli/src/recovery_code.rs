@@ -37,8 +37,10 @@
 //! 乱数、正準形、表示用の文字列のバッファには `mlock` した [`LockedBuffer`] を使い、破棄時に消去する。
 //! `mlock` に失敗した場合は処理を中止する。
 //! 符号化、文字から値への変換、チェックサムの照合は、秘密の値で分岐やメモリ参照の位置を変えないように書いている。
-//! 一方、読み取りでの区切りの判定と、使えない文字やプレフィックスの不一致による中止は、入力の内容で分岐する。
+//! 一方、読み取りと末尾の確認での区切りの判定と、使えない文字やプレフィックスの不一致による中止は、入力の内容で分岐する。
 //! 生成される機械語は検査していない。
+//!
+//! 末尾の確認 ([`RecoveryCode::confirms_suffix`]) で入力を読み替えて置くスタック上の配列は、戻る前に消去する。
 //!
 //! チェックサムの照合で使う未処理のビット、CRC の状態、2 つのチェックサムは、照合の結果によらず消去する。
 //! それ以外の一時的な値と、レジスタやスタックに複写された値の消去は保証しない。
@@ -46,8 +48,8 @@
 //! ## コアとの接続
 //!
 //! [`RecoveryCode::as_bytes`] の正準形を、`fidelogic_core` の Slot 2 の関数に渡す。
-//! 対象は `wrap_dek_slot2_code_for_header` と `unwrap_dek_slot2_code_for_header` である。
-//! コアの `normalize_recovery_code` は正準形を変更しない。
+//! コアの `normalize_recovery_code` は正準形を変更しないため、正準化を伴う `*_slot2_code_*` の関数と、
+//! 伴わない `*_slot2_*` の関数は、同じ結果になる。正準化を伴う関数は、コードを `mlock` しないヒープに複写する。
 //! コアは読み替えとチェックサムの検証を行わないため、利用者の入力は [`RecoveryCode::parse`] を通してから渡す。
 
 use core::fmt;
@@ -67,6 +69,9 @@ pub const RECOVERY_CODE_LEN: usize = 30;
 
 /// 表示用の、区切りを含む文字数。
 pub const GROUPED_RECOVERY_CODE_LEN: usize = 35;
+
+/// 控えを確認するために入力させる、末尾の文字数。
+pub const CONFIRMATION_SUFFIX_LEN: usize = 5;
 
 /// Crockford Base32 の文字集合。添字が 5 bit の値である。
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -162,6 +167,38 @@ impl RecoveryCode {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         self.code.as_slice()
+    }
+
+    /// 入力が、正準形の末尾の [`CONFIRMATION_SUFFIX_LEN`] 文字と一致するかを返す。
+    ///
+    /// 利用者がコードを控えたことの確認に使う。入力の解釈は [`RecoveryCode::parse`] と同じで、
+    /// 区切りを無視し、大文字と小文字を区別せず、誤読しやすい文字を読み替える。
+    /// コードの文字との比較は定数時間で行う。区切り、使えない文字、文字数の判定は、入力の内容で分岐する。
+    ///
+    /// # Args
+    ///
+    /// - `input`: 行の終端を含まない入力。
+    #[must_use]
+    pub fn confirms_suffix(&self, input: &[u8]) -> bool {
+        let mut provided = [0u8; CONFIRMATION_SUFFIX_LEN];
+        let mut len = 0usize;
+        let mut well_formed = true;
+        for &byte in input.iter().filter(|&&byte| byte != b'-' && byte != b' ') {
+            let (Some(slot), Some(value)) = (provided.get_mut(len), symbol_value(byte)) else {
+                well_formed = false;
+                break;
+            };
+            *slot = symbol_for(value);
+            len += 1;
+        }
+        // コードは長さ `RECOVERY_CODE_LEN` のため、末尾の取り出しは常に成功する。
+        let matched = self
+            .code
+            .as_slice()
+            .last_chunk::<CONFIRMATION_SUFFIX_LEN>()
+            .is_some_and(|expected| bool::from(ct_eq_array(expected, &provided)));
+        volatile_zeroize(&mut provided);
+        well_formed && len == CONFIRMATION_SUFFIX_LEN && matched
     }
 
     /// 表示用の、5 文字ずつ `-` で区切った形を作る。
@@ -455,6 +492,86 @@ mod tests {
     /// 読み取りの結果を、正準形かエラーにする。
     fn parsed(input: &[u8]) -> Result<Vec<u8>, RecoveryCodeError> {
         RecoveryCode::parse(input).map(|code| code.as_bytes().to_vec())
+    }
+
+    /// 連番のベクタ (末尾は `E1X9Q`) のコード。
+    fn code_with_suffix_e1x9q() -> Result<RecoveryCode, RecoveryCodeError> {
+        let [_, _, (_, secret, _, _), _] = VECTORS;
+        generate_from(secret)
+    }
+
+    #[test]
+    fn test_confirms_suffix_accepts_equivalent_input() -> TestResult {
+        let code = code_with_suffix_e1x9q()?;
+        for input in [
+            "E1X9Q",
+            "e1x9q",
+            "E1-X9 Q",
+            " -E1X9Q- ",
+            "EIX9Q",
+            "ELX9Q",
+            "elx9q",
+        ] {
+            assert!(
+                code.confirms_suffix(input.as_bytes()),
+                "{input:?} の一致の判定に失敗。"
+            );
+        }
+        // 末尾が `00014` のコードでは、`O` を `0` と読み替える。
+        let [(_, zeros, _, _), ..] = VECTORS;
+        let code = generate_from(zeros)?;
+        for input in ["00014", "OOO14", "oooi4", "000L4"] {
+            assert!(
+                code.confirms_suffix(input.as_bytes()),
+                "{input:?} の一致の判定に失敗。"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_confirms_suffix_rejects_other_input() -> TestResult {
+        let code = code_with_suffix_e1x9q()?;
+        let cases: [(&str, &[u8]); 11] = [
+            ("空", b""),
+            ("区切りだけ", b" - "),
+            ("4 文字", b"E1X9"),
+            ("末尾の 4 文字", b"1X9Q"),
+            ("6 文字", b"E1X9QQ"),
+            ("直前の 1 文字を含む", b"8E1X9Q"),
+            ("1 つ前の区切り", b"5GR38"),
+            ("入れ替え", b"1EX9Q"),
+            ("使えない文字の追加", b"E1X9QU"),
+            ("全角の文字", "Ｅ1X9Q".as_bytes()),
+            ("コードの全体", b"FL000G40R40M30E209185GR38E1X9Q"),
+        ];
+        for (name, input) in cases {
+            assert!(!code.confirms_suffix(input), "{name}の入力の拒否に失敗。");
+        }
+        Ok(())
+    }
+
+    /// 末尾の各位置で、1 文字だけを別の値の文字にした入力をすべて拒否すること。
+    #[test]
+    fn test_confirms_suffix_rejects_every_single_substitution() -> TestResult {
+        let code = code_with_suffix_e1x9q()?;
+        let suffix = *b"E1X9Q";
+        let mut rejected = 0;
+        for position in 0..suffix.len() {
+            for &symbol in ALPHABET {
+                let mut input = suffix;
+                input[position] = symbol;
+                if input != suffix {
+                    assert!(
+                        !code.confirms_suffix(&input),
+                        "位置 {position} の置換の拒否に失敗。"
+                    );
+                    rejected += 1;
+                }
+            }
+        }
+        assert_eq!(rejected, 5 * 31);
+        Ok(())
     }
 
     #[test]

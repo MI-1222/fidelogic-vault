@@ -8,7 +8,7 @@
 //!
 //! | サブコマンド | 引数 | 内容 |
 //! | :-- | :-- | :-- |
-//! | `init` | | Vault を作成し、リカバリーキットを表示する |
+//! | `init` | `--kit-html <PATH>` (任意) | Vault を作成し、リカバリーキットを表示する |
 //! | `unlock` | | Vault を解錠し、対話モードに入る |
 //! | `list` | | エントリの一覧を表示する (秘密のフィールドは表示しない) |
 //! | `get` | `<ENTRY>` | エントリを表示する |
@@ -25,6 +25,7 @@
 //! すべてのサブコマンドが `--vault <PATH>` と、パスワードの入力元の指定を受け付ける。
 //! 指定はサブコマンド名の後に置く。
 //! (`fidelogic-cli get --vault ./my.vault github`)。省略したときの既定のパスは、Vault を読み書きする処理で決める。
+//! `init` は省略を認めない。
 //!
 //! ## パスワードの入力元
 //!
@@ -71,7 +72,10 @@ pub struct CommandLine {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subcommand {
     /// `init`: Vault を作成する。
-    Init,
+    Init {
+        /// `--kit-html`: リカバリーキットを、画面の表示に加えて HTML ファイルにも書き出す場合の出力先。
+        kit_html: Option<PathBuf>,
+    },
     /// `unlock`: Vault を解錠し、対話モードに入る。
     Unlock,
     /// `list`: エントリの一覧を表示する。
@@ -114,7 +118,7 @@ impl Subcommand {
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
-            Self::Init => "init",
+            Self::Init { .. } => "init",
             Self::Unlock => "unlock",
             Self::List => "list",
             Self::Get { .. } => "get",
@@ -188,8 +192,9 @@ pub fn parse(args: &[OsString]) -> Result<CommandLine, ParseExit> {
 fn parser() -> OptionParser<CommandLine> {
     let init = subcommand(
         "init",
-        "Vault を作成し、リカバリーキットを表示する",
-        pure(Subcommand::Init),
+        // `--vault` の解析は全サブコマンドで共通のため、`Usage` の行は省略できる形になる。説明で必須を示す。
+        "Vault を作成し、リカバリーキットを表示する (--vault の指定が必須)",
+        kit_html_option().map(|kit_html| Subcommand::Init { kit_html }),
     );
     let unlock = subcommand(
         "unlock",
@@ -352,6 +357,14 @@ fn password_source_options() -> impl Parser<PasswordSource> {
     construct!([standard_input, file, descriptor]).fallback(PasswordSource::Terminal)
 }
 
+/// `init` の `--kit-html <PATH>` の定義。
+fn kit_html_option() -> impl Parser<Option<PathBuf>> {
+    long("kit-html")
+        .help("リカバリーキットを HTML ファイル (権限 0600) にも書き出す。既存のファイルは上書きしない")
+        .argument::<PathBuf>("PATH")
+        .optional()
+}
+
 /// `get` / `set` / `delete` が受け取る対象のエントリ。
 fn entry_argument() -> impl Parser<String> {
     positional::<String>("ENTRY").help("対象のエントリ")
@@ -421,6 +434,62 @@ mod tests {
             let command_line = parse_strs(args).map_err(|exit| format!("{args:?}: {exit:?}"))?;
             assert_eq!(command_line.subcommand.name(), args[0]);
             assert_eq!(command_line.vault, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_init_kit_html_option() -> TestResult {
+        assert_eq!(
+            parse_strs(&["init"])?.subcommand,
+            Subcommand::Init { kit_html: None }
+        );
+        for args in [
+            &["init", "--kit-html", "./kit.html"][..],
+            &["init", "--kit-html=./kit.html"],
+            &["init", "--vault", "v", "--kit-html", "./kit.html"],
+        ] {
+            assert_eq!(
+                parse_strs(args)?.subcommand,
+                Subcommand::Init {
+                    kit_html: Some(PathBuf::from("./kit.html"))
+                },
+                "{args:?} の解析に失敗。"
+            );
+        }
+        Ok(())
+    }
+
+    /// `Usage` の行は `--vault` を省略できる形になるため、`init` の説明で必須を示すこと。
+    #[test]
+    fn test_init_help_states_that_vault_is_required() -> TestResult {
+        for args in [&["init", "--help"][..], &["--help"]] {
+            let help = match parse_strs(args) {
+                Err(ParseExit::Help(text)) => text,
+                other => return Err(format!("{args:?} の解析に失敗: {other:?}").into()),
+            };
+            assert!(
+                help.contains("--vault の指定が必須"),
+                "{args:?} の必須の案内の確認に失敗: {help}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_kit_html_option_is_rejected_when_invalid() -> TestResult {
+        expect_invalid(&["init", "--kit-html"])?;
+        expect_invalid(&["init", "--kit-html", "a", "--kit-html", "b"])?;
+        expect_invalid(&["--kit-html", "a", "init"])?;
+        for invocation in MINIMAL_INVOCATIONS {
+            if invocation != ["init"] {
+                let args: Vec<&str> = invocation
+                    .iter()
+                    .chain(&["--kit-html", "a"])
+                    .copied()
+                    .collect();
+                expect_invalid(&args)?;
+            }
         }
         Ok(())
     }
