@@ -2,7 +2,8 @@
 //!
 //! 親が疑似端末を作成し、シェルを子の制御端末のセッションリーダーとして起動して、その下で実行ファイルを動かす。
 //! 親は疑似端末のマスター側から入力し、画面の内容と、作成されたファイルを確かめる。
-//! シェルは実行ファイルの終了コードを報告した後、親が許可するまで終了しない。
+//! シェルは実行ファイルの終了コードを報告した後、親が改行を入力するまで終了しない。
+//! 改行を受け取ると、端末から読んだ 1 行を報告する。実行ファイルが読み残した入力は、この行に現れる。
 //! macOS では、セッションリーダーが終了すると端末が無効になるため、終了の前に端末属性を調べる必要がある。
 
 // テストのクレートごとに使う項目が異なるため、未使用の項目を許す。
@@ -31,13 +32,14 @@ pub type TestResult = Result<(), Box<dyn Error>>;
 /// 子の応答を待つ上限。最適化しないビルドの鍵導出の時間を含む。
 pub const TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 実行ファイルを起動し、終了コードを報告して、親の許可を待つシェルの処理。
+/// 実行ファイルを起動して終了コードを報告し、端末から 1 行を読んで報告するシェルの処理。
 ///
 /// シグナルは無視せず捕捉する。無視の設定は実行ファイルに引き継がれ、中断を試せなくなるためである。
 pub const SHELL_SCRIPT: &str = r#"trap ':' INT QUIT TERM HUP
 "$0" "$@"
 printf 'STATUS %s\n' "$?"
-read -r release < /dev/tty
+IFS= read -r following < /dev/tty
+printf 'FOLLOWING [%s]\n' "$following"
 "#;
 
 /// [`SHELL_SCRIPT`] と同じ処理で、実行ファイルの標準出力を、読み手のいないパイプにする。
@@ -46,21 +48,24 @@ read -r release < /dev/tty
 pub const BROKEN_STDOUT_SCRIPT: &str = r#"trap ':' INT QUIT TERM HUP
 exec 3>&1
 { "$0" "$@"; printf 'STATUS %s\n' "$?" >&3; } | true
-read -r release < /dev/tty
+IFS= read -r following < /dev/tty
+printf 'FOLLOWING [%s]\n' "$following"
 "#;
 
 /// [`SHELL_SCRIPT`] と同じ処理で、記述子 3 を [`DESCRIPTOR_SOURCE`] のファイルにして実行ファイルを起動する。
 pub const DESCRIPTOR_SCRIPT: &str = r#"trap ':' INT QUIT TERM HUP
 "$0" "$@" 3<"$FIDELOGIC_CLI_INIT_DESCRIPTOR_SOURCE"
 printf 'STATUS %s\n' "$?"
-read -r release < /dev/tty
+IFS= read -r following < /dev/tty
+printf 'FOLLOWING [%s]\n' "$following"
 "#;
 
 /// [`SHELL_SCRIPT`] と同じ処理で、実行ファイルの標準入出力をすべて制御端末にする。
 pub const TERMINAL_SCRIPT: &str = r#"trap ':' INT QUIT TERM HUP
 "$0" "$@" </dev/tty >/dev/tty 2>/dev/tty
 printf 'STATUS %s\n' "$?"
-read -r release < /dev/tty
+IFS= read -r following < /dev/tty
+printf 'FOLLOWING [%s]\n' "$following"
 "#;
 
 /// [`DESCRIPTOR_SCRIPT`] が記述子 3 に開くファイルを指定する環境変数の名前。
@@ -460,7 +465,14 @@ impl Session {
     }
 
     /// 実行ファイルの終了を待ち、端末属性の復元を確かめてから、シェルを終了させる。
-    pub fn finish(mut self) -> Result<Outcome, Box<dyn Error>> {
+    pub fn finish(self) -> Result<Outcome, Box<dyn Error>> {
+        Ok(self.finish_with_following_input()?.0)
+    }
+
+    /// [`Session::finish`] と同じ処理で、実行ファイルの後にシェルが端末から読んだ 1 行も返す。
+    ///
+    /// シェルには改行だけを入力する。実行ファイルが読み残した入力がある場合は、返す行に現れる。
+    pub fn finish_with_following_input(mut self) -> Result<(Outcome, String), Box<dyn Error>> {
         let deadline = Instant::now() + TIMEOUT;
         let mut stdout = String::new();
         let status = loop {
@@ -496,18 +508,32 @@ impl Session {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        let following = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = self
+                .lines
+                .recv_timeout(remaining)
+                .map_err(|error| format!("後続の入力の報告がありません: {error}"))?;
+            if let Some(report) = line.strip_prefix("FOLLOWING [") {
+                break report
+                    .strip_suffix(']')
+                    .ok_or("後続の入力の報告が不正です。")?
+                    .to_owned();
+            }
+        };
         let mut stderr = String::new();
         self.shell
             .stderr
             .take()
             .ok_or("子の標準エラー出力がありません。")?
             .read_to_string(&mut stderr)?;
-        Ok(Outcome {
+        let outcome = Outcome {
             status,
             stdout,
             stderr,
             screen,
-        })
+        };
+        Ok((outcome, following))
     }
 }
 
