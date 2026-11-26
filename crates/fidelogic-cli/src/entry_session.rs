@@ -101,8 +101,8 @@ impl EntryKey {
         let cipher = self.cipher(loaded)?;
         open_entries(&cipher, loaded.header(), loaded.records())
             .map_err(CliError::from_unlock_error)?
-            .iter()
-            .map(|entry| Credential::decode_opened(entry).map_err(|_| CliError::MalformedEntry))
+            .into_iter()
+            .map(|entry| Credential::decode_opened(&entry).map_err(|_| CliError::MalformedEntry))
             .collect()
     }
 
