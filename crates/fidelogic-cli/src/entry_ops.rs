@@ -72,6 +72,18 @@ impl EntryField {
         }
     }
 
+    /// `set` が値を尋ねるプロンプトに使う名称を返す。
+    ///
+    /// TOTP とメモは、入力できる内容を示すため、[`EntryField::label`] と異なる。
+    #[must_use]
+    pub(crate) const fn prompt_label(self) -> &'static str {
+        match self {
+            Self::Totp => "TOTP のシードまたは otpauth URI",
+            Self::Notes => "メモ (1 行)",
+            Self::Username | Self::Password | Self::Url => self.label(),
+        }
+    }
+
     /// 画面で値を伏せる項目かを返す。
     #[must_use]
     pub const fn is_secret(self) -> bool {

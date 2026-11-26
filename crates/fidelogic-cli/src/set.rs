@@ -332,16 +332,17 @@ pub(crate) fn collect_changes(
     } else {
         "(空の Enter で変更しない)"
     };
-    let mut ask_field = |field: EntryField, label: &str| ask(field, &format!("{label} {hint}: "));
+    let mut ask_field =
+        |field: EntryField| ask(field, &format!("{} {hint}: ", field.prompt_label()));
     let mut changes = FieldChanges::default();
 
-    if let Some(input) = ask_field(EntryField::Username, "ユーザー名")? {
+    if let Some(input) = ask_field(EntryField::Username)? {
         let field = EntryField::Username;
         let canonical = username_case_mapped_secret(utf8(field, input.as_slice())?)
             .map_err(|_| CliError::InvalidField(field))?;
         changes.username = Some(canonical);
     }
-    if let Some(input) = ask_field(EntryField::Password, "パスワード")? {
+    if let Some(input) = ask_field(EntryField::Password)? {
         let field = EntryField::Password;
         let canonical = opaque_string_secret(utf8(field, input.as_slice())?)
             .map_err(|_| CliError::InvalidField(field))?;
@@ -356,17 +357,18 @@ pub(crate) fn collect_changes(
     }
     // パスワードの再入力では `ask` を直接呼ぶ。
     // 最初の `ask_field` をその後も使うと `ask` の可変借用が重なり、コンパイルできないため、定義し直す。
-    let mut ask_field = |field: EntryField, label: &str| ask(field, &format!("{label} {hint}: "));
-    if let Some(input) = ask_field(EntryField::Url, "URL")? {
+    let mut ask_field =
+        |field: EntryField| ask(field, &format!("{} {hint}: ", field.prompt_label()));
+    if let Some(input) = ask_field(EntryField::Url)? {
         changes.url = Some(utf8(EntryField::Url, input.as_slice())?.to_owned());
     }
-    if let Some(input) = ask_field(EntryField::Totp, "TOTP のシードまたは otpauth URI")? {
+    if let Some(input) = ask_field(EntryField::Totp)? {
         utf8(EntryField::Totp, input.as_slice())?;
         changes.totp = Some(input);
     }
     changes.notes = match notes {
         Some(notes) => Some(notes),
-        None => match ask_field(EntryField::Notes, "メモ (1 行)")? {
+        None => match ask_field(EntryField::Notes)? {
             Some(input) => {
                 utf8(EntryField::Notes, input.as_slice())?;
                 Some(input)
@@ -504,13 +506,17 @@ mod tests {
             ]
             .map(|value| Some(value.to_vec()))
         );
-        assert!(
-            prompts
-                .iter()
-                .filter(|prompt| prompt.contains("省略"))
-                .count()
-                == 5,
-            "新規の案内の確認に失敗: {prompts:?}"
+        assert_eq!(
+            prompts,
+            [
+                "ユーザー名 (空の Enter で省略): ",
+                "パスワード (空の Enter で省略): ",
+                "確認のため、もう一度入力してください: ",
+                "URL (空の Enter で省略): ",
+                "TOTP のシードまたは otpauth URI (空の Enter で省略): ",
+                "メモ (1 行) (空の Enter で省略): ",
+            ],
+            "新規の案内の確認に失敗。"
         );
         Ok(())
     }
