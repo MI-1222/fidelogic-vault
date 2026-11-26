@@ -43,7 +43,7 @@
 //! - プロセスが停止 (`Ctrl+Z`) している間は、DEK を消去できない。再開した時点で上限を超えていれば終了する。
 //! - 結果の出力先の読み手が止まっている間は、無操作の時間を数えない。中断のシグナルでは終了する。
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
@@ -203,7 +203,7 @@ impl<'a> Session<'a> {
         stdout: &mut impl Write,
         stderr: &mut impl Write,
     ) -> Result<LockReason, CliError> {
-        let interactive = std::io::stdin().is_terminal();
+        let interactive = commands.is_terminal();
         loop {
             reap_finished_workers();
             ensure_not_interrupted(self.watcher)?;
@@ -340,6 +340,11 @@ impl CommandReader {
             lines: LineBuffer::default(),
             ended: false,
         }
+    }
+
+    /// コマンドの入力元が端末かを返す。
+    const fn is_terminal(&self) -> bool {
+        self.stream.is_terminal()
     }
 
     /// 次の 1 行を返す。入力の終端では `None`。

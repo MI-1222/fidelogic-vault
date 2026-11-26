@@ -359,6 +359,12 @@ impl InputStream {
         })
     }
 
+    /// 入力元が端末かを返す。`true` になりうるのは、[`InputStream::commands`] で作った入力元だけである。
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.is_terminal
+    }
+
     /// 入力元が読み込めるようになるまで待ち、1 回読み込む。
     ///
     /// # Args
