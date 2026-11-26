@@ -354,6 +354,8 @@ pub(crate) fn collect_changes(
         }
         changes.password = Some(canonical);
     }
+    // パスワードの再入力では `ask` を直接呼ぶ。
+    // 最初の `ask_field` をその後も使うと `ask` の可変借用が重なり、コンパイルできないため、定義し直す。
     let mut ask_field = |field: EntryField, label: &str| ask(field, &format!("{label} {hint}: "));
     if let Some(input) = ask_field(EntryField::Url, "URL")? {
         changes.url = Some(utf8(EntryField::Url, input.as_slice())?.to_owned());
