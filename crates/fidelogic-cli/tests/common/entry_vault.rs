@@ -226,9 +226,18 @@ pub fn run_without_terminal(args: &[&str], stdin: &[u8]) -> Result<Output, Box<d
 
 /// 制御端末の無い状態で実行ファイルを起動する。標準入力は呼び出し側が書き込む。
 pub fn spawn_without_terminal(args: &[&str]) -> Result<Child, Box<dyn Error>> {
+    spawn_prepared(args, |_| {})
+}
+
+/// [`spawn_without_terminal`] と同じ処理で、`prepare` でコマンドを調整してから起動する。
+pub fn spawn_prepared(
+    args: &[&str],
+    prepare: impl FnOnce(&mut Command),
+) -> Result<Child, Box<dyn Error>> {
     let mut command = command_without_terminal(args);
     // 開発者の環境のクリップボードに、テストから接続しない。
     command.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY");
+    prepare(&mut command);
     let _guard = spawn_lock();
     Ok(command.spawn()?)
 }

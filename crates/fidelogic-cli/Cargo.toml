@@ -5,6 +5,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 
+[features]
+# test-hooks: 強制終了のテスト向けに、保存の途中で停止する失敗点を有効にするテスト専用フィーチャー。
+# デバッグアサーションの無いビルドでは、有効にしても失敗点を含めない。
+test-hooks = []
+
 [dependencies]
 fidelogic-core = { workspace = true, features = ["std", "profile-vault", "memlock", "parallel"] }
 libc = { workspace = true }

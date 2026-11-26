@@ -36,6 +36,7 @@
 //!
 //! プロセスが手順の途中で強制終了した場合 (`SIGKILL`、`panic = "abort"` など) は、一時ファイルが残ることがある。
 //! 残った一時ファイルは、後の保存の妨げにならない。名前が衝突した場合は別の名前で作り直すためである。
+//! 強制終了のテストは、テスト専用の失敗点 (`failpoint` モジュール。リリースビルドには含めない) で停止位置を作る。
 //!
 //! ## サイドカーロックの規約と限界
 //!
@@ -63,12 +64,14 @@ use core::cell::Cell;
 use core::fmt;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use tempfile::{Builder, NamedTempFile};
+
+use crate::failpoint::{self, FailPoint};
 
 /// サイドカーロックファイルの名前として、Vault のファイル名の後ろに付ける接尾辞。
 const LOCK_SUFFIX: &str = ".lock";
@@ -375,7 +378,7 @@ impl VaultLock {
         handle
             .lock()
             .map_err(|error| StorageError::os(StorageStep::Lock, &error))?;
-        Ok(Self { handle, path })
+        Ok(Self::locked(handle, path))
     }
 
     /// 排他ロックを、待たずに取得する。
@@ -389,10 +392,17 @@ impl VaultLock {
     pub fn try_acquire(path: VaultPath) -> Result<Self, StorageError> {
         let handle = open_lock_file(path.lock_file())?;
         match handle.try_lock() {
-            Ok(()) => Ok(Self { handle, path }),
+            Ok(()) => Ok(Self::locked(handle, path)),
             Err(TryLockError::WouldBlock) => Err(StorageError::Locked),
             Err(TryLockError::Error(error)) => Err(StorageError::os(StorageStep::Lock, &error)),
         }
+    }
+
+    /// ロックを取得したロックファイルから、値を作る。
+    fn locked(handle: File, path: VaultPath) -> Self {
+        let lock = Self { handle, path };
+        failpoint::hit(FailPoint::AfterLock);
+        lock
     }
 
     /// ロックの対象である Vault のパスを返す。
@@ -614,7 +624,7 @@ where
     S: Fn(&File) -> io::Result<()>,
 {
     let mut temp = create_temp_file(path)?;
-    if let Err(error) = temp.as_file_mut().write_all(contents) {
+    if let Err(error) = failpoint::write_all(temp.as_file_mut(), contents) {
         return Err(discard_temp_file(
             temp,
             StorageError::os(StorageStep::WriteTempFile, &error),
@@ -626,6 +636,7 @@ where
             StorageError::os(StorageStep::SyncTempFile, &error),
         ));
     }
+    failpoint::hit(FailPoint::BeforeRename);
     // `persist` は `rename` で置き換える。`persist_noclobber` は、置換を拒否する改名
     // (`RENAME_NOREPLACE`、`RENAME_EXCL`) を使い、使えない場合はハードリンクの作成に切り替える。
     // どちらも失敗した場合は、一時ファイルが戻り値で返る。

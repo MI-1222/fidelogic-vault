@@ -69,6 +69,7 @@ use fidelogic_core::active_profile;
 
 use crate::entry_ops::{EntryField, GetAction};
 use crate::export::ExportTarget;
+use crate::failpoint::{self, FailPoint};
 use crate::secret_input::PasswordSource;
 use crate::set::NotesSource;
 use crate::sys::clipboard::{
@@ -229,6 +230,8 @@ impl std::error::Error for ParseExit {}
 /// `--help` / `--version` が指定された場合は [`ParseExit::Help`]、
 /// 引数が誤っている場合は [`ParseExit::Invalid`] を返す。いずれも表示する文字列を持つ。
 pub fn parse(args: &[OsString]) -> Result<CommandLine, ParseExit> {
+    // 起動直後の保護が解析より前に適用されていることを、テストがこの位置で確かめる。
+    failpoint::hit(FailPoint::BeforeArgs);
     // プログラム名はヘルプの `Usage:` 行に使う。`argv[0]` ではなく固定の名前を使い、表示を起動方法に依存させない。
     let args = Args::from(args).set_name(crate::PROGRAM_NAME);
     parser().run_inner(args).map_err(|failure| match failure {

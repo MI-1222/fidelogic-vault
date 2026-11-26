@@ -258,6 +258,47 @@ fn deny_debugger_attach() -> Result<(), HardeningError> {
     }
 }
 
+/// 現在の保護の状態を、テストで比較する 1 行にする。状態は変更しない。
+///
+/// 形式は `core=<ソフト上限>,<ハード上限> umask=<8 進 4 桁>` で、Linux では ` dumpable=<値>` が続く。
+/// 上限を取得できない場合は `core=unknown` とする。
+///
+/// `umask` は、読み取るために一時的に書き換えて戻す。他のスレッドがファイルを作成しない状態で呼び出すこと。
+#[cfg(all(feature = "test-hooks", debug_assertions))]
+pub(crate) fn describe_protections() -> String {
+    let mut limit = libc::rlimit {
+        rlim_cur: libc::rlim_t::MAX,
+        rlim_max: libc::rlim_t::MAX,
+    };
+    // SAFETY: `limit` は書き込み可能な有効な `rlimit` 構造体であり、呼び出しの間は生存している。
+    // `getrlimit` はこのポインターへ書き込むだけで、保持しない。
+    let core = if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) } == 0 {
+        format!("{},{}", limit.rlim_cur, limit.rlim_max)
+    } else {
+        String::from("unknown")
+    };
+    // SAFETY: `umask` はプロセスの属性を更新するだけで、メモリを参照せず、失敗しない。
+    let umask = unsafe { libc::umask(HARDENED_UMASK) };
+    // SAFETY: 同上。読み取った値に戻す。
+    unsafe { libc::umask(umask) };
+    let report = format!("core={core} umask={umask:04o}");
+    #[cfg(target_os = "linux")]
+    let report = {
+        // SAFETY: `PR_GET_DUMPABLE` は引数を参照せず、現在の設定値を戻り値として返す。
+        let dumpable = unsafe {
+            libc::prctl(
+                libc::PR_GET_DUMPABLE,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        format!("{report} dumpable={dumpable}")
+    };
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

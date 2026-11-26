@@ -94,6 +94,7 @@ pub mod error;
 pub mod exit;
 pub mod export;
 mod export_json;
+mod failpoint;
 pub mod get;
 pub mod init;
 mod interaction;
