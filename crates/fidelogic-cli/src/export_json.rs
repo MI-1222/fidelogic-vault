@@ -47,7 +47,10 @@ const FORMAT_VERSION: u32 = 1;
 /// # Errors
 ///
 /// 書き込みに失敗した場合と、秘密の項目が UTF-8 でない場合 ([`io::ErrorKind::InvalidData`])。
-pub(crate) fn write_export(out: &mut impl Write, credentials: &[Credential]) -> io::Result<()> {
+pub(crate) fn write_export(
+    out: &mut (impl Write + ?Sized),
+    credentials: &[Credential],
+) -> io::Result<()> {
     write!(
         out,
         "{{\n  \"format\": \"{FORMAT_NAME}\",\n  \"version\": {FORMAT_VERSION},\n  \"entries\": ["
@@ -66,7 +69,7 @@ pub(crate) fn write_export(out: &mut impl Write, credentials: &[Credential]) -> 
 }
 
 /// 1 件のエントリを、JSON のオブジェクトとして書く。
-fn write_entry(out: &mut impl Write, credential: &Credential) -> io::Result<()> {
+fn write_entry(out: &mut (impl Write + ?Sized), credential: &Credential) -> io::Result<()> {
     out.write_all(b"    {\n      \"id\": \"")?;
     write_hex(out, &credential.entry_id)?;
     out.write_all(b"\"")?;
@@ -105,7 +108,7 @@ fn write_entry(out: &mut impl Write, credential: &Credential) -> io::Result<()> 
 }
 
 /// 先行するメンバーに続けて、文字列の値を持つメンバーを書く。
-fn write_member(out: &mut impl Write, name: &str, value: &[u8]) -> io::Result<()> {
+fn write_member(out: &mut (impl Write + ?Sized), name: &str, value: &[u8]) -> io::Result<()> {
     // `str` は値を借用するだけで、秘密の複写を作らない。
     let text =
         core::str::from_utf8(value).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
@@ -115,7 +118,7 @@ fn write_member(out: &mut impl Write, name: &str, value: &[u8]) -> io::Result<()
 }
 
 /// JSON の文字列の中身を書く。エスケープが要らない範囲はそのまま書く。
-fn write_string_body(out: &mut impl Write, text: &str) -> io::Result<()> {
+fn write_string_body(out: &mut (impl Write + ?Sized), text: &str) -> io::Result<()> {
     let mut rest = text;
     while let Some((position, character)) = rest
         .char_indices()
@@ -145,7 +148,7 @@ fn needs_escape(character: char) -> bool {
 }
 
 /// バイト列を、小文字の 16 進で書く。
-fn write_hex(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+fn write_hex(out: &mut (impl Write + ?Sized), bytes: &[u8]) -> io::Result<()> {
     for byte in bytes {
         write!(out, "{byte:02x}")?;
     }

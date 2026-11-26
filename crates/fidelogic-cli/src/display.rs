@@ -29,7 +29,7 @@ const UNTITLED: &str = "(タイトルなし)";
 /// # Errors
 ///
 /// 書き込みに失敗した場合。
-pub(crate) fn write_escaped(out: &mut impl Write, text: &str) -> io::Result<()> {
+pub(crate) fn write_escaped(out: &mut (impl Write + ?Sized), text: &str) -> io::Result<()> {
     let mut rest = text;
     while let Some((position, character)) = rest
         .char_indices()
@@ -65,7 +65,10 @@ pub(crate) fn escaped(text: &str) -> String {
 /// # Errors
 ///
 /// 書き込みに失敗した場合。
-pub(crate) fn write_list(out: &mut impl Write, credentials: &[Credential]) -> io::Result<()> {
+pub(crate) fn write_list(
+    out: &mut (impl Write + ?Sized),
+    credentials: &[Credential],
+) -> io::Result<()> {
     let mut sorted: Vec<&Credential> = credentials.iter().collect();
     // 同じタイトルは、Vault の記録順を保つ。
     sorted.sort_by(|left, right| left.title.cmp(&right.title));
@@ -85,7 +88,10 @@ pub(crate) fn write_list(out: &mut impl Write, credentials: &[Credential]) -> io
 /// # Errors
 ///
 /// 書き込みに失敗した場合。
-pub(crate) fn write_summary(out: &mut impl Write, credential: &Credential) -> io::Result<()> {
+pub(crate) fn write_summary(
+    out: &mut (impl Write + ?Sized),
+    credential: &Credential,
+) -> io::Result<()> {
     out.write_all("タイトル: ".as_bytes())?;
     write_escaped(out, credential.title.as_deref().unwrap_or(UNTITLED))?;
     out.write_all(b"\n")?;

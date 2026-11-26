@@ -134,17 +134,18 @@ fn interrupted_output() -> std::io::Error {
 pub(crate) fn write_output<W: Write>(
     stdout: &mut W,
     is_interrupted: &dyn Fn() -> bool,
-    write: impl FnOnce(&mut &mut dyn Write) -> std::io::Result<()>,
+    write: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
 ) -> Result<(), CliError> {
     let mut guarded = InterruptibleWriter::new(stdout, is_interrupted);
-    let mut out: &mut dyn Write = &mut guarded;
-    write(&mut out).and_then(|()| out.flush()).map_err(|_| {
-        if is_interrupted() {
-            CliError::Interrupted
-        } else {
-            CliError::OutputFailed
-        }
-    })
+    write(&mut guarded)
+        .and_then(|()| guarded.flush())
+        .map_err(|_| {
+            if is_interrupted() {
+                CliError::Interrupted
+            } else {
+                CliError::OutputFailed
+            }
+        })
 }
 
 /// 端末で同意を求める。`y` または `yes` (大文字と小文字を区別しない) を同意とする。
