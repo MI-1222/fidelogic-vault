@@ -314,6 +314,7 @@ impl LineEditor {
     /// 端末から読んだ 1 バイトを反映する。
     ///
     /// `\n` と `\r` は確定、消去キーは UTF-8 の 1 文字の消去、行消去キーは全体の消去とする。
+    /// 入力終了キーは、空の行では入力の取り消しとし、行の途中では内容に加えずに無視する。
     /// その他のバイトは内容に加える。内容の上限は、[`MAX_PASSWORD_LEN`] と `buffer` の長さの小さい方である。
     fn feed(&mut self, buffer: &mut [u8], byte: u8, keys: EditKeys) -> LineStatus {
         match byte {
