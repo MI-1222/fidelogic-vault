@@ -383,10 +383,10 @@ fn test_crate_roots_deny_unsafe_code() -> TestResult {
 }
 
 #[test]
-fn test_sys_has_four_boundaries_declared_in_mod() -> TestResult {
+fn test_sys_declares_all_boundaries_in_mod() -> TestResult {
     let sys_dir = source_dir().join("sys");
     let mod_source = std::fs::read_to_string(sys_dir.join("mod.rs"))?;
-    for name in ["process", "storage", "tty", "clipboard"] {
+    for name in ["process", "storage", "signal", "tty", "clipboard", "random"] {
         let path = sys_dir.join(format!("{name}.rs"));
         assert!(
             path.is_file(),
