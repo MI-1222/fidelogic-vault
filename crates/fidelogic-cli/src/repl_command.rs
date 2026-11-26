@@ -159,7 +159,7 @@ fn parse_entry(
     }
     // タイトルは、`--` で始まる語の手前までとする。
     let end = option_start(rest).unwrap_or(rest.len());
-    let (title, mut options) = rest.split_at(end);
+    let (title, mut options) = rest.split_at_checked(end).unwrap_or((rest, ""));
     while !options.is_empty() {
         let (word, tail) = split_word(options);
         options = parse_action(word, tail, accepts_action, &mut action)?;

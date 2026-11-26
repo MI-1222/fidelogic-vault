@@ -126,12 +126,11 @@ pub fn seal_entries<R>(
     cipher: &VaultCipher,
     header: &VaultHeader,
     entries: &[EntrySource<'_>],
-    fill_random: R,
+    mut fill_random: R,
 ) -> Result<Vec<TlvRecord>, VaultError>
 where
     R: FnMut(&mut [u8]) -> Result<(), SystemError>,
 {
-    let mut fill_random = fill_random;
     if header.suite_id != cipher.suite_id().as_u8() {
         return Err(invalid_parameter());
     }
