@@ -271,25 +271,20 @@ fn execute(
             stdout,
             stderr,
         ),
-        Subcommand::Recover {
-            keep_recovery_code,
-            kit_html,
-        } => recover::run(
+        Subcommand::Recover { recovery_code } => recover::run(
             RecoverRequest {
                 vault,
                 password_source,
-                keep_recovery_code: *keep_recovery_code,
-                kit_html: kit_html.as_deref(),
+                recovery_code: recovery_code.as_deref(),
             },
             stdout,
             stderr,
         ),
-        Subcommand::RotateKey { mode, kit_html } => rotate_key::run(
+        Subcommand::RotateKey { mode } => rotate_key::run(
             RotateKeyRequest {
                 vault,
                 password_source,
-                mode: *mode,
-                kit_html: kit_html.as_deref(),
+                mode,
             },
             stdout,
             stderr,

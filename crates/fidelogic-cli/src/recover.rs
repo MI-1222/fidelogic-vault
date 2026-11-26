@@ -34,10 +34,11 @@ use std::path::Path;
 
 use fidelogic_core::SlotCredential;
 
+use crate::args::RecoveryCodePlan;
 use crate::error::CliError;
 use crate::interaction::read_new_password;
 use crate::key_update::{
-    UnlockedVault, UpdateKind, UpdateTarget, report_new_recovery_code, update_and_save,
+    UnlockedVault, UpdateKind, UpdateTarget, report_recovery_code, update_and_save,
 };
 use crate::recovery_code::{RecoveryCode, RecoveryCodeError};
 use crate::secret_input::{PasswordSource, SecretInputError, read_password};
@@ -53,10 +54,8 @@ pub struct RecoverRequest<'a> {
     pub vault: Option<&'a Path>,
     /// 新しいマスターパスワードの入力元。
     pub password_source: &'a PasswordSource,
-    /// `--keep-recovery-code`: リカバリーコードを再発行しない。
-    pub keep_recovery_code: bool,
-    /// `--kit-html` で指定された、HTML の出力先。
-    pub kit_html: Option<&'a Path>,
+    /// リカバリーコードの扱いと、再発行する場合の HTML の出力先。
+    pub recovery_code: RecoveryCodePlan<&'a Path>,
 }
 
 /// リカバリーコードで解錠し、マスターパスワードを再設定する。
@@ -88,9 +87,7 @@ pub fn run(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<(), CliError> {
-    // 指定しない場合に使わない出力先を、事前の確認にも渡さない。
-    let kit_html = request.kit_html.filter(|_| !request.keep_recovery_code);
-    let (target, loaded) = UpdateTarget::open(request.vault, kit_html)?;
+    let (target, loaded) = UpdateTarget::open(request.vault, request.recovery_code.kit_html())?;
 
     let code = read_recovery_code(&target.watcher)?;
     // 正準化を伴う資格情報は、コードを `mlock` しないヒープに複写するため使わない。
@@ -98,16 +95,13 @@ pub fn run(
     drop(code);
 
     let password = read_new_password(request.password_source, &target.watcher)?;
-    let kind = UpdateKind::Rewrap {
-        new_recovery_code: !request.keep_recovery_code,
-    };
-    update_and_save(&target, unlocked, password, kind, kit_html, stderr)?;
+    let kind = UpdateKind::Rewrap(request.recovery_code);
+    update_and_save(&target, unlocked, password, kind, stderr)?;
 
     report(
         stdout,
         target.lock.vault_path().file(),
-        kind.issues_recovery_code(),
-        kit_html,
+        request.recovery_code,
     )
     .map_err(|_| CliError::OutputFailed)
 }
@@ -129,16 +123,13 @@ fn read_recovery_code(watcher: &InterruptWatcher) -> Result<RecoveryCode, CliErr
 fn report(
     stdout: &mut impl Write,
     vault: &Path,
-    issued: bool,
-    kit_html: Option<&Path>,
+    recovery_code: RecoveryCodePlan<&Path>,
 ) -> std::io::Result<()> {
     writeln!(
         stdout,
         "マスターパスワードを再設定しました: {}",
         vault.display()
     )?;
-    if issued {
-        report_new_recovery_code(stdout, kit_html)?;
-    }
+    report_recovery_code(stdout, recovery_code)?;
     stdout.flush()
 }

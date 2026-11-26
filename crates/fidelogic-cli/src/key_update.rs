@@ -32,6 +32,7 @@ use fidelogic_core::{
     VaultEngine, VaultError, open_entries,
 };
 
+use crate::args::RecoveryCodePlan;
 use crate::error::CliError;
 use crate::interaction::{
     PendingKit, confirm_recovery_kit, ensure_kit_destination_is_free, ensure_not_interrupted,
@@ -140,22 +141,22 @@ fn decrypt_entries(
 
 /// 鍵の更新の種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UpdateKind {
+pub(crate) enum UpdateKind<'a> {
     /// DEK を変えずに、スロットを包み直す。
-    Rewrap {
-        /// リカバリーコードも再発行する。
-        new_recovery_code: bool,
-    },
+    Rewrap(RecoveryCodePlan<&'a Path>),
     /// DEK を作り直す。リカバリーコードは常に再発行する。
-    ReplaceDek,
+    ReplaceDek {
+        /// 再発行するリカバリーキットの HTML の出力先。
+        kit_html: Option<&'a Path>,
+    },
 }
 
-impl UpdateKind {
-    /// リカバリーコードを再発行するかを返す。
-    pub(crate) const fn issues_recovery_code(self) -> bool {
+impl<'a> UpdateKind<'a> {
+    /// この更新でのリカバリーコードの扱いを返す。
+    pub(crate) const fn recovery_code(self) -> RecoveryCodePlan<&'a Path> {
         match self {
-            Self::Rewrap { new_recovery_code } => new_recovery_code,
-            Self::ReplaceDek => true,
+            Self::Rewrap(plan) => plan,
+            Self::ReplaceDek { kit_html } => RecoveryCodePlan::Reissue { kit_html },
         }
     }
 }
@@ -165,7 +166,7 @@ impl UpdateKind {
 /// # Args
 ///
 /// - `password`: 新しい Slot 0 に使う、正準化済みのパスワード。スロットを作った後に消去する。
-/// - `kit_html`: 再発行するリカバリーキットの HTML の出力先。再発行しない場合は使わない。
+/// - `kind`: 更新の種類。リカバリーコードを再発行するかと、HTML の出力先を含む。
 /// - `stderr`: 警告の書き込み先。
 ///
 /// # Errors
@@ -181,19 +182,20 @@ pub(crate) fn update_and_save(
     target: &UpdateTarget,
     unlocked: UnlockedVault,
     password: SecretVec,
-    kind: UpdateKind,
-    kit_html: Option<&Path>,
+    kind: UpdateKind<'_>,
     stderr: &mut impl Write,
 ) -> Result<(), CliError> {
-    let code = if kind.issues_recovery_code() {
-        Some(RecoveryCode::generate(fill_random)?)
-    } else {
-        None
+    let plan = kind.recovery_code();
+    let code = match plan {
+        RecoveryCodePlan::Keep => None,
+        RecoveryCodePlan::Reissue { .. } => Some(RecoveryCode::generate(fill_random)?),
     };
     let change = match (kind, code.as_ref()) {
-        (UpdateKind::Rewrap { .. }, recovery_code) => KeyChange::Rewrap { recovery_code },
-        (UpdateKind::ReplaceDek, Some(recovery_code)) => KeyChange::ReplaceDek { recovery_code },
-        (UpdateKind::ReplaceDek, None) => return Err(CliError::InvalidState),
+        (UpdateKind::Rewrap(_), recovery_code) => KeyChange::Rewrap { recovery_code },
+        (UpdateKind::ReplaceDek { .. }, Some(recovery_code)) => {
+            KeyChange::ReplaceDek { recovery_code }
+        }
+        (UpdateKind::ReplaceDek { .. }, None) => return Err(CliError::InvalidState),
     };
     let updated = update_keys(
         unlocked.loaded.header(),
@@ -209,7 +211,7 @@ pub(crate) fn update_and_save(
     ensure_not_interrupted(&target.watcher)?;
 
     let kit = match code.as_ref() {
-        Some(code) => present_recovery_code(target, code, kit_html)?,
+        Some(code) => present_recovery_code(target, code, plan.kit_html())?,
         None => None,
     };
     let issued = code.is_some();
@@ -276,14 +278,47 @@ fn present_recovery_code<'a>(
     Ok(kit)
 }
 
-/// 新しいリカバリーコードを有効にしたことと、書き出した HTML の扱いを書く。
-pub(crate) fn report_new_recovery_code(
+/// リカバリーコードを再発行した場合に、新しいコードを有効にしたことと、書き出した HTML の扱いを書く。
+/// 再発行しない場合は、何も書かない。
+pub(crate) fn report_recovery_code(
     stdout: &mut impl Write,
-    kit_html: Option<&Path>,
+    plan: RecoveryCodePlan<&Path>,
 ) -> std::io::Result<()> {
+    let RecoveryCodePlan::Reissue { kit_html } = plan else {
+        return Ok(());
+    };
     writeln!(
         stdout,
         "新しいリカバリーコードを有効にしました。以前のコードは、更新後の Vault では使えません。"
     )?;
     report_kit(stdout, kit_html)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::UpdateKind;
+    use crate::args::RecoveryCodePlan;
+
+    #[test]
+    fn test_recovery_code_plan_follows_update_kind() {
+        let kit_html = Some(Path::new("kit"));
+        let reissue = RecoveryCodePlan::Reissue { kit_html };
+        let cases = [
+            (
+                UpdateKind::Rewrap(RecoveryCodePlan::Keep),
+                RecoveryCodePlan::Keep,
+            ),
+            (UpdateKind::Rewrap(reissue), reissue),
+            (UpdateKind::ReplaceDek { kit_html }, reissue),
+            (
+                UpdateKind::ReplaceDek { kit_html: None },
+                RecoveryCodePlan::Reissue { kit_html: None },
+            ),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.recovery_code(), expected, "{kind:?} の判定に失敗。");
+        }
+    }
 }

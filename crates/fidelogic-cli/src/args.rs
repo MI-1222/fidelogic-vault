@@ -61,7 +61,7 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bpaf::parsers::NamedArg;
 use bpaf::{Args, OptionParser, ParseFailure, Parser, construct, long, positional, pure, short};
@@ -128,8 +128,6 @@ pub enum Subcommand {
     RotateKey {
         /// 更新の方式。
         mode: RotateMode,
-        /// `--kit-html`: 再発行するリカバリーキットを、画面の表示に加えて HTML ファイルにも書き出す場合の出力先。
-        kit_html: Option<PathBuf>,
     },
     /// `export`: Vault の内容を書き出す。
     Export {
@@ -140,10 +138,8 @@ pub enum Subcommand {
     },
     /// `recover`: リカバリーコードで解錠し、マスターパスワードを再設定する。
     Recover {
-        /// `--keep-recovery-code`: リカバリーコードを再発行せず、使ったコードを残す。
-        keep_recovery_code: bool,
-        /// `--kit-html`: 再発行するリカバリーキットを、画面の表示に加えて HTML ファイルにも書き出す場合の出力先。
-        kit_html: Option<PathBuf>,
+        /// リカバリーコードの扱い。`--keep-recovery-code` を指定した場合は、使ったコードを残す。
+        recovery_code: RecoveryCodePlan,
     },
     /// `__clipboard-worker`: クリップボードへコピーし、一定時間の後に消去する内部用のワーカー。
     ///
@@ -174,27 +170,56 @@ impl Subcommand {
 }
 
 /// `rotate-key` の更新の方式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RotateMode {
     /// `--kek-only` (既定): DEK を変えずに、スロットの KEK だけを更新する。
     KekOnly {
-        /// `--new-recovery-code`: リカバリーコード (Slot 2) も再発行する。
-        new_recovery_code: bool,
+        /// リカバリーコードの扱い。`--new-recovery-code` を指定した場合は再発行する。
+        recovery_code: RecoveryCodePlan,
     },
-    /// `--full-dek`: 新しい DEK で全エントリを再暗号化する。
+    /// `--full-dek`: 新しい DEK で全エントリを再暗号化する。リカバリーコードは常に再発行する。
     FullDek {
         /// `--drop-prf-slot`: WebAuthn PRF のスロット (Slot 1) を、確認せずに破棄する。
         drop_prf_slot: bool,
+        /// `--kit-html`: 再発行するリカバリーキットを、画面の表示に加えて HTML ファイルにも書き出す場合の出力先。
+        kit_html: Option<PathBuf>,
     },
 }
 
-impl RotateMode {
-    /// リカバリーコードを再発行する方式かを返す。`--full-dek` は常に再発行する。
+/// リカバリーコード (Slot 2) の扱い。HTML の出力先は、再発行する場合だけ持つ。
+///
+/// `P` はパスの型である。解析の結果は [`PathBuf`]、サブコマンドへの指定は借用した [`Path`] を使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryCodePlan<P = PathBuf> {
+    /// 再発行せず、現在のコードを残す。
+    Keep,
+    /// 再発行する。
+    Reissue {
+        /// `--kit-html`: 再発行するリカバリーキットを、画面の表示に加えて HTML ファイルにも書き出す場合の出力先。
+        kit_html: Option<P>,
+    },
+}
+
+impl RecoveryCodePlan<PathBuf> {
+    /// HTML の出力先を借用した形を返す。
     #[must_use]
-    pub const fn issues_recovery_code(self) -> bool {
+    pub fn as_deref(&self) -> RecoveryCodePlan<&Path> {
         match self {
-            Self::KekOnly { new_recovery_code } => new_recovery_code,
-            Self::FullDek { .. } => true,
+            Self::Keep => RecoveryCodePlan::Keep,
+            Self::Reissue { kit_html } => RecoveryCodePlan::Reissue {
+                kit_html: kit_html.as_deref(),
+            },
+        }
+    }
+}
+
+impl<'a> RecoveryCodePlan<&'a Path> {
+    /// HTML の出力先を返す。再発行しない場合と、出力先の指定が無い場合は `None`。
+    #[must_use]
+    pub const fn kit_html(self) -> Option<&'a Path> {
+        match self {
+            Self::Keep => None,
+            Self::Reissue { kit_html } => kit_html,
         }
     }
 }
@@ -504,21 +529,41 @@ fn recover_arguments() -> impl Parser<Subcommand> {
             "`--kit-html` はリカバリーコードを再発行する場合だけ指定できます。`--keep-recovery-code` と同時に指定しないでください。",
         )
         .map(|(keep_recovery_code, kit_html)| Subcommand::Recover {
-            keep_recovery_code,
-            kit_html,
+            recovery_code: recovery_code_plan(!keep_recovery_code, kit_html),
         })
 }
 
 /// `rotate-key` の指定。`--kit-html` は、リカバリーコードを再発行する場合だけ受け付ける。
 fn rotate_key_arguments() -> impl Parser<Subcommand> {
-    let mode = rotate_mode();
+    let flags = rotate_flags();
     let kit_html = kit_html_option();
-    construct!(mode, kit_html)
+    construct!(flags, kit_html)
         .guard(
-            |(mode, kit_html)| mode.issues_recovery_code() || kit_html.is_none(),
+            |(flags, kit_html)| {
+                let keeps_code = matches!(
+                    flags,
+                    RotateFlags::KekOnly {
+                        new_recovery_code: false
+                    }
+                );
+                !keeps_code || kit_html.is_none()
+            },
             "`--kit-html` はリカバリーコードを再発行する場合 (`--new-recovery-code` または `--full-dek`) だけ指定できます。",
         )
-        .map(|(mode, kit_html)| Subcommand::RotateKey { mode, kit_html })
+        .map(|(flags, kit_html)| Subcommand::RotateKey {
+            mode: flags.with_kit_html(kit_html),
+        })
+}
+
+/// 再発行の有無と出力先から、リカバリーコードの扱いを作る。
+///
+/// 再発行しない場合は、出力先を持たない。その場合の出力先の指定は、呼び出し側の `guard` が先に引数の誤りにする。
+fn recovery_code_plan(reissue: bool, kit_html: Option<PathBuf>) -> RecoveryCodePlan {
+    if reissue {
+        RecoveryCodePlan::Reissue { kit_html }
+    } else {
+        RecoveryCodePlan::Keep
+    }
 }
 
 /// `get` / `set` / `delete` が受け取る対象のエントリ。
@@ -595,12 +640,36 @@ fn idle_timeout_option() -> impl Parser<u64> {
         .display_fallback()
 }
 
+/// `rotate-key` の方式のフラグ。`--kit-html` の指定と合わせて [`RotateMode`] にする。
+#[derive(Debug, Clone, Copy)]
+enum RotateFlags {
+    /// `--kek-only` (省略を含む)。
+    KekOnly { new_recovery_code: bool },
+    /// `--full-dek`。
+    FullDek { drop_prf_slot: bool },
+}
+
+impl RotateFlags {
+    /// `--kit-html` の指定を加えて、更新の方式にする。
+    fn with_kit_html(self, kit_html: Option<PathBuf>) -> RotateMode {
+        match self {
+            Self::KekOnly { new_recovery_code } => RotateMode::KekOnly {
+                recovery_code: recovery_code_plan(new_recovery_code, kit_html),
+            },
+            Self::FullDek { drop_prf_slot } => RotateMode::FullDek {
+                drop_prf_slot,
+                kit_html,
+            },
+        }
+    }
+}
+
 /// `rotate-key` の方式の指定。
 ///
 /// `--kek-only` と `--full-dek` は同時に指定できない。どちらも無い場合は `--kek-only` として扱う。
 /// `--drop-prf-slot` は `--full-dek` と組み合わせたときだけ受け付ける。
 /// `--new-recovery-code` は `--kek-only` (省略を含む) でだけ受け付ける。`--full-dek` は常に再発行する。
-fn rotate_mode() -> impl Parser<RotateMode> {
+fn rotate_flags() -> impl Parser<RotateFlags> {
     let kek_only_flag = long("kek-only")
         .help("DEK を変えずに、スロットの KEK だけを更新する (既定)")
         .req_flag(())
@@ -609,7 +678,7 @@ fn rotate_mode() -> impl Parser<RotateMode> {
         .help("--kek-only と併用し、リカバリーコードも再発行する")
         .switch();
     let kek_only = construct!(kek_only_flag, new_recovery_code)
-        .map(|(_, new_recovery_code)| RotateMode::KekOnly { new_recovery_code });
+        .map(|(_, new_recovery_code)| RotateFlags::KekOnly { new_recovery_code });
     let full_dek_flag = long("full-dek")
         .help("新しい DEK で全エントリを再暗号化し、リカバリーコードを再発行する")
         .req_flag(());
@@ -617,7 +686,7 @@ fn rotate_mode() -> impl Parser<RotateMode> {
         .help("--full-dek と併用し、WebAuthn PRF のスロットを確認せずに破棄する")
         .switch();
     let full_dek = construct!(full_dek_flag, drop_prf_slot)
-        .map(|((), drop_prf_slot)| RotateMode::FullDek { drop_prf_slot });
+        .map(|((), drop_prf_slot)| RotateFlags::FullDek { drop_prf_slot });
     // `--kek-only` の側は、指定が何も無くても成功するため、`--full-dek` の側を先に置く。
     construct!([full_dek, kek_only])
 }
@@ -627,7 +696,7 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{CommandLine, ParseExit, RotateMode, Subcommand, parse};
+    use super::{CommandLine, ParseExit, RecoveryCodePlan, RotateMode, Subcommand, parse};
     use crate::entry_ops::{EntryField, GetAction};
     use crate::export::ExportTarget;
     use crate::secret_input::PasswordSource;
@@ -1057,58 +1126,50 @@ mod tests {
 
     /// `--new-recovery-code` を指定しない `--kek-only`。
     const KEK_ONLY: RotateMode = RotateMode::KekOnly {
-        new_recovery_code: false,
+        recovery_code: RecoveryCodePlan::Keep,
     };
+
+    /// `--new-recovery-code` を指定し、HTML の出力先が無い `--kek-only`。
+    const KEK_ONLY_REISSUE: RotateMode = RotateMode::KekOnly {
+        recovery_code: RecoveryCodePlan::Reissue { kit_html: None },
+    };
+
+    /// HTML の出力先が無い `--full-dek`。
+    const fn full_dek(drop_prf_slot: bool) -> RotateMode {
+        RotateMode::FullDek {
+            drop_prf_slot,
+            kit_html: None,
+        }
+    }
 
     #[test]
     fn test_rotate_key_modes() -> TestResult {
         let cases: [(&[&str], RotateMode); 8] = [
             (&["rotate-key"], KEK_ONLY),
             (&["rotate-key", "--kek-only"], KEK_ONLY),
-            (
-                &["rotate-key", "--new-recovery-code"],
-                RotateMode::KekOnly {
-                    new_recovery_code: true,
-                },
-            ),
+            (&["rotate-key", "--new-recovery-code"], KEK_ONLY_REISSUE),
             (
                 &["rotate-key", "--kek-only", "--new-recovery-code"],
-                RotateMode::KekOnly {
-                    new_recovery_code: true,
-                },
+                KEK_ONLY_REISSUE,
             ),
             (
                 &["rotate-key", "--new-recovery-code", "--kek-only"],
-                RotateMode::KekOnly {
-                    new_recovery_code: true,
-                },
+                KEK_ONLY_REISSUE,
             ),
-            (
-                &["rotate-key", "--full-dek"],
-                RotateMode::FullDek {
-                    drop_prf_slot: false,
-                },
-            ),
+            (&["rotate-key", "--full-dek"], full_dek(false)),
             (
                 &["rotate-key", "--drop-prf-slot", "--full-dek"],
-                RotateMode::FullDek {
-                    drop_prf_slot: true,
-                },
+                full_dek(true),
             ),
             (
                 &["rotate-key", "--full-dek", "--drop-prf-slot"],
-                RotateMode::FullDek {
-                    drop_prf_slot: true,
-                },
+                full_dek(true),
             ),
         ];
         for (args, expected) in cases {
             assert_eq!(
                 parse_strs(args)?.subcommand,
-                Subcommand::RotateKey {
-                    mode: expected,
-                    kit_html: None
-                },
+                Subcommand::RotateKey { mode: expected },
                 "{args:?} の解析に失敗。",
             );
         }
@@ -1129,56 +1190,40 @@ mod tests {
     }
 
     #[test]
-    fn test_recovery_code_is_issued_by_new_code_and_full_dek() {
-        let cases = [
-            (KEK_ONLY, false),
+    fn test_rotate_key_kit_html_requires_new_recovery_code() -> TestResult {
+        let kit = || Some(PathBuf::from("kit"));
+        let cases: [(&[&str], RotateMode); 3] = [
             (
+                &["rotate-key", "--new-recovery-code", "--kit-html", "kit"],
                 RotateMode::KekOnly {
-                    new_recovery_code: true,
+                    recovery_code: RecoveryCodePlan::Reissue { kit_html: kit() },
                 },
-                true,
             ),
             (
+                &["rotate-key", "--kit-html=kit", "--full-dek"],
                 RotateMode::FullDek {
                     drop_prf_slot: false,
+                    kit_html: kit(),
                 },
-                true,
             ),
             (
+                &[
+                    "rotate-key",
+                    "--full-dek",
+                    "--drop-prf-slot",
+                    "--kit-html",
+                    "kit",
+                ],
                 RotateMode::FullDek {
                     drop_prf_slot: true,
+                    kit_html: kit(),
                 },
-                true,
             ),
         ];
-        for (mode, expected) in cases {
+        for (args, expected) in cases {
             assert_eq!(
-                mode.issues_recovery_code(),
-                expected,
-                "{mode:?} の判定に失敗。"
-            );
-        }
-    }
-
-    #[test]
-    fn test_rotate_key_kit_html_requires_new_recovery_code() -> TestResult {
-        for args in [
-            &["rotate-key", "--new-recovery-code", "--kit-html", "kit"][..],
-            &["rotate-key", "--kit-html=kit", "--full-dek"],
-            &[
-                "rotate-key",
-                "--full-dek",
-                "--drop-prf-slot",
-                "--kit-html",
-                "kit",
-            ],
-        ] {
-            let Subcommand::RotateKey { kit_html, .. } = parse_strs(args)?.subcommand else {
-                return Err(format!("{args:?} の解析に失敗。").into());
-            };
-            assert_eq!(
-                kit_html,
-                Some(PathBuf::from("kit")),
+                parse_strs(args)?.subcommand,
+                Subcommand::RotateKey { mode: expected },
                 "{args:?} の出力先の解析に失敗。"
             );
         }
@@ -1197,23 +1242,22 @@ mod tests {
 
     #[test]
     fn test_recover_options() -> TestResult {
-        let cases: [(&[&str], bool, Option<&str>); 4] = [
-            (&["recover"], false, None),
-            (&["recover", "--keep-recovery-code"], true, None),
-            (&["recover", "--kit-html", "kit"], false, Some("kit")),
+        let reissue = |kit: Option<&str>| RecoveryCodePlan::Reissue {
+            kit_html: kit.map(PathBuf::from),
+        };
+        let cases: [(&[&str], RecoveryCodePlan); 4] = [
+            (&["recover"], reissue(None)),
+            (&["recover", "--keep-recovery-code"], RecoveryCodePlan::Keep),
+            (&["recover", "--kit-html", "kit"], reissue(Some("kit"))),
             (
                 &["recover", "--vault", "v", "--kit-html=kit"],
-                false,
-                Some("kit"),
+                reissue(Some("kit")),
             ),
         ];
-        for (args, keep, kit) in cases {
+        for (args, recovery_code) in cases {
             assert_eq!(
                 parse_strs(args)?.subcommand,
-                Subcommand::Recover {
-                    keep_recovery_code: keep,
-                    kit_html: kit.map(PathBuf::from),
-                },
+                Subcommand::Recover { recovery_code },
                 "{args:?} の解析に失敗。"
             );
         }

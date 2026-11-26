@@ -39,7 +39,7 @@ use crate::args::RotateMode;
 use crate::error::CliError;
 use crate::interaction::{ask_consent, read_canonical_password, read_new_password};
 use crate::key_update::{
-    UnlockedVault, UpdateKind, UpdateTarget, report_new_recovery_code, update_and_save,
+    UnlockedVault, UpdateKind, UpdateTarget, report_recovery_code, update_and_save,
 };
 use crate::rekey::has_prf_slot;
 use crate::secret_input::PasswordSource;
@@ -61,10 +61,8 @@ pub struct RotateKeyRequest<'a> {
     pub vault: Option<&'a Path>,
     /// 現在のマスターパスワードの入力元。
     pub password_source: &'a PasswordSource,
-    /// 更新の方式。
-    pub mode: RotateMode,
-    /// `--kit-html` で指定された、HTML の出力先。
-    pub kit_html: Option<&'a Path>,
+    /// 更新の方式。リカバリーコードを再発行する場合は、HTML の出力先を含む。
+    pub mode: &'a RotateMode,
 }
 
 /// 現在のマスターパスワードで解錠し、鍵を更新する。
@@ -95,11 +93,13 @@ pub fn run(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<(), CliError> {
-    // 再発行しない場合に使わない出力先を、事前の確認にも渡さない。
-    let kit_html = request
-        .kit_html
-        .filter(|_| request.mode.issues_recovery_code());
-    let (target, loaded) = UpdateTarget::open(request.vault, kit_html)?;
+    let kind = match request.mode {
+        RotateMode::KekOnly { recovery_code } => UpdateKind::Rewrap(recovery_code.as_deref()),
+        RotateMode::FullDek { kit_html, .. } => UpdateKind::ReplaceDek {
+            kit_html: kit_html.as_deref(),
+        },
+    };
+    let (target, loaded) = UpdateTarget::open(request.vault, kind.recovery_code().kit_html())?;
 
     let current = read_canonical_password(
         request.password_source,
@@ -109,28 +109,25 @@ pub fn run(
     let unlocked = UnlockedVault::unlock(loaded, SlotCredential::password(current.as_slice()))?;
     drop(current);
 
-    let kind = match request.mode {
-        RotateMode::KekOnly { new_recovery_code } => UpdateKind::Rewrap { new_recovery_code },
-        RotateMode::FullDek { .. } => UpdateKind::ReplaceDek,
-    };
-    let drops_prf_slot = kind == UpdateKind::ReplaceDek && has_prf_slot(unlocked.loaded().slots());
+    let drops_prf_slot =
+        matches!(kind, UpdateKind::ReplaceDek { .. }) && has_prf_slot(unlocked.loaded().slots());
     if drops_prf_slot
         && let RotateMode::FullDek {
             drop_prf_slot: false,
+            ..
         } = request.mode
     {
         confirm_prf_removal(request.password_source, &target.watcher)?;
     }
 
     let password = read_new_password(&PasswordSource::Terminal, &target.watcher)?;
-    update_and_save(&target, unlocked, password, kind, kit_html, stderr)?;
+    update_and_save(&target, unlocked, password, kind, stderr)?;
 
     report(
         stdout,
         target.lock.vault_path().file(),
         kind,
         drops_prf_slot,
-        kit_html,
     )
     .map_err(|_| CliError::OutputFailed)
 }
@@ -154,20 +151,17 @@ fn confirm_prf_removal(
 fn report(
     stdout: &mut impl Write,
     vault: &Path,
-    kind: UpdateKind,
+    kind: UpdateKind<'_>,
     dropped_prf_slot: bool,
-    kit_html: Option<&Path>,
 ) -> std::io::Result<()> {
     let summary = match kind {
-        UpdateKind::Rewrap { .. } => "鍵を更新しました",
-        UpdateKind::ReplaceDek => "DEK を更新し、全エントリを暗号化し直しました",
+        UpdateKind::Rewrap(_) => "鍵を更新しました",
+        UpdateKind::ReplaceDek { .. } => "DEK を更新し、全エントリを暗号化し直しました",
     };
     writeln!(stdout, "{summary}: {}", vault.display())?;
     if dropped_prf_slot {
         writeln!(stdout, "WebAuthn PRF のスロットを破棄しました。")?;
     }
-    if kind.issues_recovery_code() {
-        report_new_recovery_code(stdout, kit_html)?;
-    }
+    report_recovery_code(stdout, kind.recovery_code())?;
     stdout.flush()
 }
