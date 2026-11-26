@@ -74,7 +74,7 @@ pub fn run(request: GetRequest<'_>, stdout: &mut impl Write) -> Result<(), CliEr
     present(
         credential,
         request.action,
-        false,
+        ValueEnding::None,
         stdout,
         &|| watcher.is_interrupted(),
         copy_with_auto_clear,
@@ -98,11 +98,20 @@ pub(crate) const fn lookup_error(error: LookupError) -> CliError {
     }
 }
 
+/// 値だけを出力する場合に、値の後に加える終端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValueEnding {
+    /// 何も加えない。
+    None,
+    /// 改行を加える。対話モードで、値と次の入力の案内を分けるために使う。
+    Newline,
+}
+
 /// 1 件のエントリを、指定の方法で出力する。
 ///
 /// # Args
 ///
-/// - `newline`: 値だけを書く場合に、末尾に改行を加えるか。対話モードで、次の入力の案内と分けるために使う。
+/// - `ending`: 値だけを書く場合に、値の後に加える終端。他の出力の方法では使わない。
 /// - `is_interrupted`: 中断のシグナルを受けたかを返す処理。
 /// - `copy`: クリップボードへコピーする処理。呼ぶ前に、エントリは消去する。
 ///
@@ -112,7 +121,7 @@ pub(crate) const fn lookup_error(error: LookupError) -> CliError {
 pub(crate) fn present(
     credential: Credential,
     action: GetAction,
-    newline: bool,
+    ending: ValueEnding,
     stdout: &mut impl Write,
     is_interrupted: &dyn Fn() -> bool,
     copy: impl FnOnce(&str, HistoryPolicy) -> Result<(), ClipboardError>,
@@ -125,10 +134,10 @@ pub(crate) fn present(
             let value = field.value(&credential).ok_or(CliError::FieldNotSet)?;
             write_output(stdout, is_interrupted, |out| {
                 out.write_all(value)?;
-                if newline {
-                    out.write_all(b"\n")?;
+                match ending {
+                    ValueEnding::None => Ok(()),
+                    ValueEnding::Newline => out.write_all(b"\n"),
                 }
-                Ok(())
             })
         }
         GetAction::Copy(field) => {
@@ -162,7 +171,7 @@ mod tests {
 
     use fidelogic_core::{Credential, SecretVec};
 
-    use super::{present, select};
+    use super::{ValueEnding, present, select};
     use crate::entry_ops::{EntryField, GetAction};
     use crate::error::CliError;
     use crate::sys::clipboard::{ClipboardError, HistoryPolicy};
@@ -181,13 +190,17 @@ mod tests {
     /// 出力の結果、書いた内容、コピーした内容。
     type Presented = (Result<(), CliError>, Vec<u8>, Vec<(String, HistoryPolicy)>);
 
-    fn run(action: GetAction, newline: bool, copy_result: Result<(), ClipboardError>) -> Presented {
+    fn run(
+        action: GetAction,
+        ending: ValueEnding,
+        copy_result: Result<(), ClipboardError>,
+    ) -> Presented {
         let copied = RefCell::new(Vec::new());
         let mut stdout = Vec::new();
         let result = present(
             entry("site"),
             action,
-            newline,
+            ending,
             &mut stdout,
             &|| false,
             |text, policy| {
@@ -200,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_summary_does_not_reveal_secrets_or_copy() -> TestResult {
-        let (result, stdout, copied) = run(GetAction::Summary, false, Ok(()));
+        let (result, stdout, copied) = run(GetAction::Summary, ValueEnding::None, Ok(()));
         assert_eq!(result, Ok(()));
         let stdout = String::from_utf8(stdout)?;
         assert!(stdout.contains("ユーザー名: alice\n"));
@@ -211,14 +224,13 @@ mod tests {
 
     #[test]
     fn test_print_writes_the_stored_bytes_only() {
-        for (newline, expected) in [
-            (false, &b"line 1\n\x1b[2J\nline 3\n"[..]),
-            (true, b"line 1\n\x1b[2J\nline 3\n\n"),
+        for (ending, expected) in [
+            (ValueEnding::None, &b"line 1\n\x1b[2J\nline 3\n"[..]),
+            (ValueEnding::Newline, b"line 1\n\x1b[2J\nline 3\n\n"),
         ] {
-            let (result, stdout, copied) =
-                run(GetAction::Print(EntryField::Notes), newline, Ok(()));
+            let (result, stdout, copied) = run(GetAction::Print(EntryField::Notes), ending, Ok(()));
             assert_eq!(result, Ok(()));
-            assert_eq!(stdout, expected, "改行 {newline} の出力の確認に失敗。");
+            assert_eq!(stdout, expected, "終端 {ending:?} の出力の確認に失敗。");
             assert!(copied.is_empty());
         }
     }
@@ -233,7 +245,7 @@ mod tests {
             ),
             (EntryField::Username, "alice", HistoryPolicy::Allow),
         ] {
-            let (result, stdout, copied) = run(GetAction::Copy(field), false, Ok(()));
+            let (result, stdout, copied) = run(GetAction::Copy(field), ValueEnding::None, Ok(()));
             assert_eq!(result, Ok(()));
             assert_eq!(copied, [(value.to_owned(), policy)]);
             let stdout = String::from_utf8(stdout)?;
@@ -251,7 +263,7 @@ mod tests {
             GetAction::Print(EntryField::Totp),
             GetAction::Copy(EntryField::Url),
         ] {
-            let (result, stdout, copied) = run(action, true, Ok(()));
+            let (result, stdout, copied) = run(action, ValueEnding::Newline, Ok(()));
             assert_eq!(
                 result,
                 Err(CliError::FieldNotSet),
@@ -265,7 +277,7 @@ mod tests {
     fn test_copy_failure_is_reported_without_success_message() {
         let (result, stdout, _) = run(
             GetAction::Copy(EntryField::Password),
-            false,
+            ValueEnding::None,
             Err(ClipboardError::Unavailable),
         );
         assert_eq!(
@@ -281,7 +293,7 @@ mod tests {
         let result = present(
             entry("site"),
             GetAction::Print(EntryField::Password),
-            false,
+            ValueEnding::None,
             &mut stdout,
             &|| true,
             |_, _| Ok(()),

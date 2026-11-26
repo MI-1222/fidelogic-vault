@@ -273,7 +273,7 @@ impl<'a> Session<'a> {
                 get::present(
                     credential,
                     action,
-                    true,
+                    get::ValueEnding::Newline,
                     stdout,
                     &is_interrupted,
                     copy_with_auto_clear,
