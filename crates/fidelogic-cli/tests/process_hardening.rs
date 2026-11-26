@@ -115,7 +115,7 @@ fn test_harden_process_applies_protections_in_isolated_process() -> TestResult {
         // 親のハード上限が 0 のときは、硬化前に 0 以外の上限を作れない。
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),
-            "スキップ: 親プロセスの RLIMIT_CORE が 0 のため、変更前の状態を再現できません。\n"
+            "親プロセスの RLIMIT_CORE が 0 のため、RLIMIT_CORE の変更は確かめずに続けます。\n"
                 .as_bytes(),
         );
     }

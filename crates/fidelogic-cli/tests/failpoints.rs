@@ -257,7 +257,7 @@ mod enabled {
         if initial == 0 {
             let _ = std::io::Write::write_all(
                 &mut std::io::stderr(),
-                "スキップ: 親プロセスの RLIMIT_CORE が 0 のため、変更前の状態を再現できません。\n"
+                "親プロセスの RLIMIT_CORE が 0 のため、RLIMIT_CORE の変更は確かめずに続けます。\n"
                     .as_bytes(),
             );
         }
