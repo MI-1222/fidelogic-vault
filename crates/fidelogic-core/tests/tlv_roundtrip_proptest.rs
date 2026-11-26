@@ -673,7 +673,7 @@ mod crypto_vault_roundtrip_tests {
         fn prop_encrypted_mixed_vault_roundtrip_and_unknown_invariance(
             suite in arb_cipher_suite(),
             version in any::<u8>(),
-            epoch_id in 1u64..u64::MAX,
+            epoch_id in 0u64..u64::MAX,
             dek_raw in any::<[u8; DEK_LEN]>(),
             prf_secret in prop::collection::vec(any::<u8>(), SLOT1_MIN_PRF_LEN..=64),
             salt in any::<[u8; SLOT1_SALT_LEN]>(),
@@ -785,14 +785,13 @@ mod crypto_vault_roundtrip_tests {
             prop_assert_eq!(&observed_unknowns, &unknown_specs);
 
             // 世代更新＋新規エントリ追記後も未知タグの順序・生バイト列が完全不変であることを検証。
+            // スロットの AAD は epoch_id を含まないため、Slot 1 は再ラップせずに引き継ぐ。
             let next_header = deserialized
                 .header
                 .checked_increment_epoch()
                 .expect("epoch_id < u64::MAX のためインクリメントに成功。");
             let next_aad = next_header.associated_data();
-            let next_slot1 =
-                wrap_dek_slot1_for_header(unlocked_dek, &prf_secret, &salt, &slot_nonce, &next_header)
-                    .map_err(|e| TestCaseError::fail(format!("次世代Slot 1 ラップ失敗: {e:?}")))?;
+            let carried_slots = deserialized.slots.clone();
 
             let mut next_records: Vec<TlvRecord> = deserialized
                 .records
@@ -808,7 +807,7 @@ mod crypto_vault_roundtrip_tests {
             new_payload_ct.extend_from_slice(&new_ct_buf);
             next_records.push(TlvRecord::Entry(EntryPayload::new(new_payload_ct, new_tag)));
 
-            let updated_vault = Vault::new(next_header, vec![next_slot1], next_records);
+            let updated_vault = Vault::new(next_header, carried_slots, next_records);
             let updated_wire = serialize(&updated_vault)
                 .map_err(|e| TestCaseError::fail(format!("更新Vaultシリアライズ失敗: {e:?}")))?;
             let (reloaded, reloaded_rest) = deserialize(&updated_wire)
@@ -824,6 +823,41 @@ mod crypto_vault_roundtrip_tests {
                 })
                 .collect();
             prop_assert_eq!(reloaded_unknowns, unknown_specs);
+
+            // 世代を進めた Vault を、再ラップしていない Slot 1 で解錠できることを検証。
+            let mut reloaded_engine = VaultEngine::from_slot_entries(&reloaded.slots);
+            reloaded_engine
+                .unlock_vault_with_prf(&reloaded, &prf_secret)
+                .map_err(|e| TestCaseError::fail(format!("世代更新後のSlot 1 解錠失敗: {e:?}")))?;
+            let reloaded_dek = reloaded_engine
+                .dek()
+                .map_err(|e| TestCaseError::fail(format!("世代更新後のDEK取得失敗: {e:?}")))?;
+            prop_assert_eq!(reloaded_dek.as_bytes(), dek.as_bytes());
+            prop_assert!(reloaded == updated_vault);
+
+            // 追記エントリは新世代のヘッダー全体 (epoch_id を含む) で復号でき、旧世代のヘッダーでは復号できない。
+            let appended = match reloaded.records.last() {
+                Some(TlvRecord::Entry(ep)) => ep,
+                _ => return Err(TestCaseError::fail("追記エントリが末尾に存在しない。")),
+            };
+            let reloaded_cipher = VaultCipher::new_from_secret(restored_suite, reloaded_dek);
+            let (appended_nonce, appended_ct) = appended.ciphertext.split_at(nonce_len);
+            let mut appended_pt = appended_ct.to_vec();
+            reloaded_cipher
+                .decrypt_in_place_detached(
+                    appended_nonce,
+                    &reloaded.header.associated_data(),
+                    &mut appended_pt,
+                    &appended.auth_tag,
+                )
+                .map_err(|e| TestCaseError::fail(format!("新世代AADでの追記エントリ復号失敗: {e:?}")))?;
+            prop_assert_eq!(&appended_pt, &update_plaintext);
+            let mut stale_pt = appended_ct.to_vec();
+            prop_assert!(
+                reloaded_cipher
+                    .decrypt_in_place_detached(appended_nonce, &aad, &mut stale_pt, &appended.auth_tag)
+                    .is_err()
+            );
         }
     }
 }

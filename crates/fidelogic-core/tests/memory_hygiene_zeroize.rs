@@ -7,6 +7,7 @@
 //! メモリ上に残留せず確実にゼロクリアされることを検証する。
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -27,8 +28,15 @@ const DEK_SENTINEL: [u8; 32] = *b"FIDELOGIC_MEM_HYGIENE_DEK_BYTES!";
 /// グローバルアロケータ追跡の排他制御ロック。
 static ALLOC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-/// ヒープ解放時検査の有効化フラグ。
-static TRACKING_ACTIVE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// ヒープ解放時検査の有効化フラグ。
+    ///
+    /// アロケータはプロセス全体で共有されるため、フラグもスレッド単位で持つ。
+    /// 検査区間を実行しているスレッドの解放だけを検査対象とし、
+    /// 並列実行中の他テストが行う解放を誤検知しないようにする。
+    /// `const` 初期化かつ `Drop` を持たない型なので、`dealloc` 内で参照しても割り当ては発生しない。
+    static TRACKING_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
 
 /// 検査対象サイズの解放回数カウンタ。
 static CHECKED_DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -106,7 +114,7 @@ unsafe impl GlobalAlloc for MemoryHygieneAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if TRACKING_ACTIVE.load(Ordering::SeqCst) && layout.size() >= 8 {
+        if TRACKING_ACTIVE.get() && layout.size() >= 8 {
             CHECKED_DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
             unsafe { check_freed_memory_for_patterns(ptr, layout.size()) };
         }
@@ -128,8 +136,47 @@ unsafe impl GlobalAlloc for MemoryHygieneAllocator {
 #[global_allocator]
 static GLOBAL: MemoryHygieneAllocator = MemoryHygieneAllocator;
 
+/// 検査区間中に観測されるべき、検査対象サイズ (8 バイト以上) のヒープ解放回数の期待値。
+#[derive(Clone, Copy)]
+enum DeallocExpectation {
+    /// 指定回数以上の解放が観測されること。
+    AtLeast(usize),
+    /// 解放が 1 回も観測されないこと。
+    None,
+}
+
 /// 監視パターンをロックフリーテーブルへ登録し、指定クロージャ実行中のヒープ解放残留を検査する。
+///
+/// 検査区間で `min_expected_deallocs` 回以上の解放が観測されることも検証する。
+/// 解放が起きないことを検証する場合は [`run_with_no_heap_dealloc`] を使う。
 fn run_with_heap_leak_check<F, R>(patterns: &[&[u8]], min_expected_deallocs: usize, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    assert!(
+        min_expected_deallocs >= 1,
+        "解放回数の下限に 0 を指定すると検査が成立しないため、run_with_no_heap_dealloc を使用すること。"
+    );
+    check_heap_leaks(
+        patterns,
+        DeallocExpectation::AtLeast(min_expected_deallocs),
+        f,
+    )
+}
+
+/// 検査区間中に、検査対象サイズ (8 バイト以上) のヒープ解放が 1 回も発生しないことを検査する。
+///
+/// 中間バッファを確保せずに完了する経路 (即時のエラー返却など) の検証に使う。
+/// 解放が 0 回であれば残留を検査する対象も無いため、監視パターンは受け取らない。
+fn run_with_no_heap_dealloc<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    check_heap_leaks(&[], DeallocExpectation::None, f)
+}
+
+/// [`run_with_heap_leak_check`] と [`run_with_no_heap_dealloc`] の共通実装。
+fn check_heap_leaks<F, R>(patterns: &[&[u8]], expectation: DeallocExpectation, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -161,9 +208,9 @@ where
     LAST_LEAK_ALLOC_SIZE.store(0, Ordering::SeqCst);
     LAST_LEAK_OFFSET.store(0, Ordering::SeqCst);
 
-    TRACKING_ACTIVE.store(true, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(true);
     let result = f();
-    TRACKING_ACTIVE.store(false, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(false);
 
     let dealloc_count = CHECKED_DEALLOC_COUNT.load(Ordering::SeqCst);
     let leak_mask = LEAK_DETECTED_MASK.load(Ordering::SeqCst);
@@ -176,10 +223,16 @@ where
     }
     PATTERN_COUNT.store(0, Ordering::SeqCst);
 
-    assert!(
-        dealloc_count >= min_expected_deallocs,
-        "期待されるヒープ解放回数に未達: observed={dealloc_count}, expected>={min_expected_deallocs}"
-    );
+    match expectation {
+        DeallocExpectation::AtLeast(min_expected_deallocs) => assert!(
+            dealloc_count >= min_expected_deallocs,
+            "期待されるヒープ解放回数に未達: observed={dealloc_count}, expected>={min_expected_deallocs}"
+        ),
+        DeallocExpectation::None => assert_eq!(
+            dealloc_count, 0,
+            "ヒープ解放が発生しない想定の区間で解放を観測: observed={dealloc_count}"
+        ),
+    }
     let leak_size = LAST_LEAK_ALLOC_SIZE.load(Ordering::SeqCst);
     let leak_offset = LAST_LEAK_OFFSET.load(Ordering::SeqCst);
     assert_eq!(
@@ -244,9 +297,9 @@ where
     CHECKED_DEALLOC_COUNT.store(0, Ordering::SeqCst);
     LEAK_DETECTED_MASK.store(0, Ordering::SeqCst);
 
-    TRACKING_ACTIVE.store(true, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(true);
     f();
-    TRACKING_ACTIVE.store(false, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(false);
 
     let dealloc_count = CHECKED_DEALLOC_COUNT.load(Ordering::SeqCst);
     let leak_mask = LEAK_DETECTED_MASK.load(Ordering::SeqCst);
@@ -396,9 +449,9 @@ fn test_opaque_string_memory_hygiene_success_and_error() {
     );
 
     // 2. opaque_string_secret エラー返却後:
-    // 禁止文字混入による失敗時、中間アロケーションなしで即座にエラーを返し、
-    // 残留データが存在しないことを検証。
-    run_with_heap_leak_check(&[pattern_pw_raw, pattern_bad, cps_bytes], 0, || {
+    // 禁止文字に到達するまでの出力が書き込まれたバッファが確保されるため、解放が観測される。
+    // 失敗時にそのバッファがゼロ消去され、平文の断片が残留しないことを検証。
+    run_with_heap_leak_check(&[pattern_pw_raw, pattern_bad, cps_bytes], 1, || {
         let err = opaque_string_secret(bad_password)
             .expect_err("禁止コードポイントにより失敗することを検証。");
         assert_eq!(err, PrecisError::DisallowedCodePoint(0x0000));
@@ -418,9 +471,10 @@ fn test_opaque_string_memory_hygiene_success_and_error() {
     );
 
     // 4. enforce_opaque_string_cps エラー返却時のメモリ衛生:
-    // スライス入力時でも中間 Vec<u32> を生成せず、失敗時の中間データ残留がないことを検証。
+    // 禁止文字に到達するまでの出力を書き込む Vec<u32> が確保されるため、解放が観測される。
+    // 失敗時にそのバッファの内容が残留しないことを検証。
     let bad_cps: Vec<u32> = bad_password.chars().map(|c| c as u32).collect();
-    run_with_heap_leak_check(&[cps_bytes], 0, || {
+    run_with_heap_leak_check(&[cps_bytes], 1, || {
         let err = enforce_opaque_string_cps(&bad_cps)
             .expect_err("enforce_opaque_string_cps 失敗を検証。");
         assert_eq!(err, PrecisError::DisallowedCodePoint(0x0000));
@@ -459,15 +513,19 @@ fn test_username_case_mapped_memory_hygiene_success_and_error() {
     let cps_bytes = unsafe { core::slice::from_raw_parts(cps_slice.as_ptr().cast::<u8>(), 12) };
 
     // 1. username_case_mapped 禁止文字 (0x0020 空白) によるエラー時:
-    // 中間 Vec<u32> アロケーションを行わずに即座にエラー返却し、データ残留がないことを検証。
-    run_with_heap_leak_check(&[cps_bytes], 0, || {
+    // 中間 Vec<u32> は生成しないが、禁止文字に到達するまでの出力を書き込む文字列バッファは確保される。
+    // 失敗時に解放が観測されることを検証する。
+    // 監視パターンは入力側の綴りで、小文字化後の出力側の断片は検査対象に含まれない。
+    run_with_heap_leak_check(&[cps_bytes], 1, || {
         let err =
             username_case_mapped(user_raw).expect_err("空白文字が含まれるため失敗することを検証。");
         assert_eq!(err, PrecisError::DisallowedCodePoint(0x0020));
     });
 
     // 2. enforce_username_case_mapped_cps エラー返却時のメモリ衛生:
-    run_with_heap_leak_check(&[cps_bytes], 0, || {
+    // 禁止文字に到達するまでの出力を書き込む Vec<u32> が確保されるため、解放が観測される。
+    // 監視パターンは入力側の綴りで、小文字化後の出力側の断片は検査対象に含まれない。
+    run_with_heap_leak_check(&[cps_bytes], 1, || {
         let err = enforce_username_case_mapped_cps(&bad_cps)
             .expect_err("enforce_username_case_mapped_cps 失敗を検証。");
         assert_eq!(err, PrecisError::DisallowedCodePoint(0x0020));
@@ -484,7 +542,9 @@ fn test_username_case_mapped_memory_hygiene_success_and_error() {
     });
 
     // 4. username_case_mapped_secret エラー返却時のメモリ衛生:
-    run_with_heap_leak_check(&[pattern_user_raw], 0, || {
+    // 禁止文字に到達するまでの出力を書き込む SecretVec が確保されるため、解放が観測される。
+    // 監視パターンは入力側の綴りで、小文字化後の出力側の断片は検査対象に含まれない。
+    run_with_heap_leak_check(&[pattern_user_raw], 1, || {
         let err = username_case_mapped_secret(user_raw)
             .expect_err("禁止コードポイントにより失敗することを検証。");
         assert_eq!(err, PrecisError::DisallowedCodePoint(0x0020));
@@ -557,7 +617,7 @@ fn test_locked_buffer_memory_hygiene_on_zeroize_and_drop() {
     use fidelogic_core::LockedBuffer;
     use zeroize::Zeroize;
 
-    run_with_heap_leak_check(&[&DEK_SENTINEL], 0, || {
+    let exercise = || {
         let mut buf1 = LockedBuffer::new(DEK_SENTINEL);
         assert_eq!(buf1.as_bytes(), &DEK_SENTINEL);
         buf1.zeroize();
@@ -571,7 +631,18 @@ fn test_locked_buffer_memory_hygiene_on_zeroize_and_drop() {
         let buf2 = LockedBuffer::new(DEK_SENTINEL);
         assert_eq!(buf2.as_bytes(), &DEK_SENTINEL);
         drop(buf2);
-    });
+    };
+
+    // `mlock` に失敗する環境 (非特権のコンテナなど) ではヒープへフォールバックするため、
+    // ロックの成否を検査区間の外で調べ、経路ごとに解放回数の期待値を切り替える。
+    let is_page_locked = LockedBuffer::new(DEK_SENTINEL).is_locked();
+    if is_page_locked {
+        // ページロック経路ではヒープを確保しないため、解放が 1 回も観測されない。
+        run_with_no_heap_dealloc(exercise);
+    } else {
+        // フォールバック経路では 2 つのバッファ分のヒープ解放が観測され、いずれも消去済みである。
+        run_with_heap_leak_check(&[&DEK_SENTINEL], 2, exercise);
+    }
 }
 
 #[cfg(all(feature = "alloc", feature = "profile-vault"))]
@@ -584,9 +655,9 @@ mod vault_memory_hygiene_tests {
     };
     use fidelogic_core::slots::{
         SLOT0_NONCE_LEN, SLOT0_SALT_LEN, SLOT1_NONCE_LEN, SLOT1_SALT_LEN, SLOT2_NONCE_LEN,
-        SLOT2_SALT_LEN, SlotCredential, normalize_recovery_code, unwrap_dek_slot0_with_secret,
-        unwrap_dek_slot1, unwrap_dek_slot2_code, wrap_dek_slot0, wrap_dek_slot0_with_secret,
-        wrap_dek_slot1, wrap_dek_slot2_code,
+        SLOT2_SALT_LEN, SlotCredential, normalize_recovery_code, slot_header_binding,
+        unwrap_dek_slot0_with_secret, unwrap_dek_slot1, unwrap_dek_slot2_code, wrap_dek_slot0,
+        wrap_dek_slot0_with_secret, wrap_dek_slot1, wrap_dek_slot2_code,
     };
     use fidelogic_core::tlv::{EntryPayload, TlvRecord, Vault, VaultHeader};
     use fidelogic_core::{
@@ -987,7 +1058,7 @@ mod vault_memory_hygiene_tests {
         });
 
         // AAD ゼロアロケーション化により、失敗時のヒープ確保・解放は発生しない。
-        run_with_heap_leak_check(&[&DEK_SENTINEL, &kek1, prf_secret], 0, || {
+        run_with_no_heap_dealloc(|| {
             assert_eq!(
                 unwrap_dek_slot1(&slot1_entry, &[0x99u8; 32], vault_aad).err(),
                 Some(VaultError::Crypto(CryptoError::AeadDecryptionFailed))
@@ -1078,18 +1149,27 @@ mod vault_memory_hygiene_tests {
 
         let engine_test_for_suite = |suite: CipherSuiteId, record_nonce: &[u8]| {
             let header = VaultHeader::new(1, suite.as_u8(), 7);
+            // エントリはヘッダー全体、スロットはヘッダー不変部 (epoch_id を含まない) を AAD に結合する。
             let aad = header.associated_data();
+            let slot_aad = slot_header_binding(&header);
 
-            let slot0 = wrap_dek_slot0(&dek, password, &slot0_salt, &slot0_nonce, &params, &aad)
-                .expect("Vault 用 Slot 0 生成に成功。");
-            let slot1 = wrap_dek_slot1(&dek, prf_secret, &slot1_salt, &slot1_nonce, &aad)
+            let slot0 = wrap_dek_slot0(
+                &dek,
+                password,
+                &slot0_salt,
+                &slot0_nonce,
+                &params,
+                &slot_aad,
+            )
+            .expect("Vault 用 Slot 0 生成に成功。");
+            let slot1 = wrap_dek_slot1(&dek, prf_secret, &slot1_salt, &slot1_nonce, &slot_aad)
                 .expect("Vault 用 Slot 1 生成に成功。");
             let slot2 = wrap_dek_slot2_code(
                 &dek,
                 recovery_code_formatted,
                 &slot2_salt,
                 &slot2_nonce,
-                &aad,
+                &slot_aad,
             )
             .expect("Vault 用 Slot 2 生成に成功。");
 
@@ -1371,7 +1451,7 @@ mod vault_memory_hygiene_tests {
                 .expect("ランダム Slot 1 生成に成功。");
 
             let header = VaultHeader::new(1, suite.as_u8(), 1);
-            let slot_aad = header.associated_data();
+            let slot_aad = slot_header_binding(&header);
             let slot1_for_vault = wrap_dek_slot1(&dek_secret, &raw_prf, &salt, &nonce, &slot_aad)
                 .expect("Vault ヘッダーバインド Slot 1 生成に成功。");
             let vault = Vault::new(header, vec![slot1_for_vault], Vec::new());
@@ -1403,4 +1483,65 @@ mod vault_memory_hygiene_tests {
             })?;
         }
     }
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn test_entry_seal_open_memory_hygiene_success_and_error() {
+    use fidelogic_core::cipher::{CipherSuiteId, VaultCipher};
+    use fidelogic_core::entry::{EntrySource, open_entries, seal_entries};
+    use fidelogic_core::error::VaultError;
+    use fidelogic_core::tlv::{TlvRecord, VaultHeader};
+
+    // 2 チャンクにまたがるように、センチネルを 7 回繰り返した 224 バイトを平文とする (1 チャンクの容量は 193 バイト)。
+    let mut plaintext = Vec::new();
+    for _ in 0..7 {
+        plaintext.extend_from_slice(&PLAINTEXT_SENTINEL);
+    }
+    let suite = CipherSuiteId::XChaCha20Poly1305;
+    let cipher = VaultCipher::new(suite, &DEK_SENTINEL);
+    let header = VaultHeader::new(1, suite.as_u8(), 3);
+    let entries = [EntrySource {
+        entry_id: [7u8; 16],
+        data: &plaintext,
+    }];
+    let mut counter = 0u8;
+    let rng = move |buf: &mut [u8]| {
+        counter = counter.wrapping_add(1);
+        buf.fill(counter);
+        Ok(())
+    };
+
+    // 1. 暗号化: ヒープ上の一時領域 (マニフェストなど) の解放時に、平文と DEK が残らないこと。
+    //    作業領域はスタック上の SecretBytes で、このアロケータ検査では消去を確認できない。
+    let records = run_with_heap_leak_check(&[&PLAINTEXT_SENTINEL, &DEK_SENTINEL], 1, || {
+        seal_entries(&cipher, &header, &entries, rng).expect("エントリの暗号化に成功。")
+    });
+
+    // 2. 復号の成功: 連結用の SecretVec が破棄された後に、平文がヒープに残らないこと。
+    run_with_heap_leak_check(&[&PLAINTEXT_SENTINEL, &DEK_SENTINEL], 1, || {
+        let opened = open_entries(&cipher, &header, &records).expect("エントリの復号に成功。");
+        assert_eq!(opened[0].data.as_slice(), plaintext.as_slice());
+        drop(opened);
+    });
+
+    // 3. 復号の失敗 (別世代のヘッダー): 最初のチャンクで認証に失敗し、ヒープを使わずに終わること。
+    //    (実測: 連結用の SecretVec は最初のチャンクを読むまで確保されず、解放は 0 回)
+    let stale_header = VaultHeader::new(1, suite.as_u8(), 2);
+    run_with_no_heap_dealloc(|| {
+        let err = open_entries(&cipher, &stale_header, &records)
+            .expect_err("別世代のヘッダーでの復号が成功してしまいました。");
+        assert_eq!(err, VaultError::AuthenticationFailed);
+    });
+
+    // 4. 復号の失敗 (末尾レコードの改ざん): 先頭のチャンクまで連結した平文が、失敗時にヒープへ残らないこと。
+    let mut tampered = records.clone();
+    if let Some(TlvRecord::Entry(payload)) = tampered.last_mut() {
+        payload.auth_tag[0] ^= 1;
+    }
+    run_with_heap_leak_check(&[&PLAINTEXT_SENTINEL, &DEK_SENTINEL], 1, || {
+        let err = open_entries(&cipher, &header, &tampered)
+            .expect_err("改ざんされたレコードの復号が成功してしまいました。");
+        assert_eq!(err, VaultError::AuthenticationFailed);
+    });
 }

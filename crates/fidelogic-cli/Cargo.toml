@@ -3,6 +3,22 @@ name = "fidelogic-cli"
 description = "Native command-line interface for fidelogic-vault"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
+
+[features]
+# test-hooks: 強制終了のテスト向けに、保存の途中で停止する失敗点を有効にするテスト専用フィーチャー。
+# デバッグアサーションの無いビルドでは、有効にしても失敗点を含めない。
+test-hooks = []
 
 [dependencies]
-fidelogic-core = { workspace = true, features = ["profile-vault"] }
+fidelogic-core = { workspace = true, features = ["std", "profile-vault", "memlock", "parallel"] }
+libc = { workspace = true }
+bpaf = { version = "0.9", default-features = false }
+tempfile = { version = "3.27", default-features = false }
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+getrandom = { version = "0.4", default-features = false }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

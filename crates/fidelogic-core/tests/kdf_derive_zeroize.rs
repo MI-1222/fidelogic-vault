@@ -8,6 +8,7 @@
 #![cfg(all(feature = "alloc", feature = "profile-vault"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use fidelogic_core::{Argon2Params, CryptoError};
@@ -15,7 +16,14 @@ use fidelogic_core::{Argon2Params, CryptoError};
 /// ヒープ残留検査用の固定長鍵センチネル値。
 const KEY_SENTINEL: &[u8; 32] = b"FIDELOGIC_DERIVED_KEY_SENTINEL!!";
 
-static TRACKING_ACTIVE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// ヒープ解放時検査の有効化フラグ。
+    ///
+    /// アロケータはプロセス全体で共有されるため、フラグはスレッド単位で持つ。
+    /// 検査区間を実行しているスレッドの解放だけを検査対象とし、他スレッドの解放を誤検知しないようにする。
+    /// `const` 初期化かつ `Drop` を持たない型なので、`dealloc` 内で参照しても割り当ては発生しない。
+    static TRACKING_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
 static LEAK_DETECTED: AtomicBool = AtomicBool::new(false);
 static CHECKED_DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -28,7 +36,7 @@ unsafe impl GlobalAlloc for ZeroizeCheckingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if TRACKING_ACTIVE.load(Ordering::SeqCst) && layout.size() >= KEY_SENTINEL.len() {
+        if TRACKING_ACTIVE.get() && layout.size() >= KEY_SENTINEL.len() {
             CHECKED_DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
             let freed_bytes = unsafe { core::slice::from_raw_parts(ptr, layout.size()) };
             if freed_bytes
@@ -57,7 +65,7 @@ fn test_kdf_derive_key_vec_no_heap_residue_on_failure() {
 
     LEAK_DETECTED.store(false, Ordering::SeqCst);
     CHECKED_DEALLOC_COUNT.store(0, Ordering::SeqCst);
-    TRACKING_ACTIVE.store(true, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(true);
 
     let res = params.derive_key_vec_with_secret_fn(password, salt, secret, |_, _, _, out| {
         hook_called = true;
@@ -69,7 +77,7 @@ fn test_kdf_derive_key_vec_no_heap_residue_on_failure() {
         Err(CryptoError::KeyDerivationFailed)
     });
 
-    TRACKING_ACTIVE.store(false, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(false);
 
     assert!(
         hook_called,
@@ -96,12 +104,12 @@ fn test_kdf_derive_key_vec_no_heap_residue_on_failure() {
     // 陽性対照: 通常の Vec<u8> をゼロ消去せず解放した場合にリークを検知できることを確認する。
     LEAK_DETECTED.store(false, Ordering::SeqCst);
     CHECKED_DEALLOC_COUNT.store(0, Ordering::SeqCst);
-    TRACKING_ACTIVE.store(true, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(true);
     {
         let leaked_vec = core::hint::black_box(KEY_SENTINEL.to_vec());
         drop(leaked_vec);
     }
-    TRACKING_ACTIVE.store(false, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(false);
 
     assert!(
         CHECKED_DEALLOC_COUNT.load(Ordering::SeqCst) >= 1,

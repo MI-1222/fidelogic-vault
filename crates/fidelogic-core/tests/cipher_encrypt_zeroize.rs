@@ -7,6 +7,7 @@
 #![cfg(all(feature = "alloc", feature = "profile-vault"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use fidelogic_core::{
@@ -17,7 +18,14 @@ use fidelogic_core::{
 /// ヒープ残留検査用の固定長平文センチネル値。
 const PLAINTEXT_SENTINEL: &[u8; 32] = b"FIDELOGIC_SECRET_PLAINTEXT_TEST!";
 
-static TRACKING_ACTIVE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// ヒープ解放時検査の有効化フラグ。
+    ///
+    /// アロケータはプロセス全体で共有されるため、フラグはスレッド単位で持つ。
+    /// 検査区間を実行しているスレッドの解放だけを検査対象とし、他スレッドの解放を誤検知しないようにする。
+    /// `const` 初期化かつ `Drop` を持たない型なので、`dealloc` 内で参照しても割り当ては発生しない。
+    static TRACKING_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
 static LEAK_DETECTED: AtomicBool = AtomicBool::new(false);
 static CHECKED_DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -30,7 +38,7 @@ unsafe impl GlobalAlloc for ZeroizeCheckingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if TRACKING_ACTIVE.load(Ordering::SeqCst) && layout.size() >= PLAINTEXT_SENTINEL.len() {
+        if TRACKING_ACTIVE.get() && layout.size() >= PLAINTEXT_SENTINEL.len() {
             CHECKED_DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
             let freed_bytes = unsafe { core::slice::from_raw_parts(ptr, layout.size()) };
             if freed_bytes
@@ -61,7 +69,7 @@ fn assert_no_heap_residue_on_encrypt_failure(
 
     LEAK_DETECTED.store(false, Ordering::SeqCst);
     CHECKED_DEALLOC_COUNT.store(0, Ordering::SeqCst);
-    TRACKING_ACTIVE.store(true, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(true);
 
     let res = cipher.encrypt_with_detached(nonce, plaintext, aad, |_, _, _, buf| {
         hook_called = true;
@@ -72,7 +80,7 @@ fn assert_no_heap_residue_on_encrypt_failure(
         Err(CryptoError::AeadEncryptionFailed)
     });
 
-    TRACKING_ACTIVE.store(false, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(false);
 
     assert!(
         hook_called,
@@ -130,12 +138,12 @@ fn test_vault_cipher_encrypt_no_heap_plaintext_residue_on_failure() {
     // 陽性対照: ゼロ消去を行わずに解放した場合に検査アロケータがリークを検知できることを確認する。
     LEAK_DETECTED.store(false, Ordering::SeqCst);
     CHECKED_DEALLOC_COUNT.store(0, Ordering::SeqCst);
-    TRACKING_ACTIVE.store(true, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(true);
     {
         let leaked_vec = core::hint::black_box(PLAINTEXT_SENTINEL.to_vec());
         drop(leaked_vec);
     }
-    TRACKING_ACTIVE.store(false, Ordering::SeqCst);
+    TRACKING_ACTIVE.set(false);
 
     assert!(
         CHECKED_DEALLOC_COUNT.load(Ordering::SeqCst) >= 1,

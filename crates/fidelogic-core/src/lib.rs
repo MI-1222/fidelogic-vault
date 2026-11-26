@@ -45,8 +45,12 @@ pub mod memlock;
 #[cfg(feature = "profile-vault")]
 pub mod cipher;
 pub mod constant_time;
+#[cfg(feature = "profile-vault")]
+pub mod credential;
 #[cfg(feature = "profile-lite")]
 pub mod curve25519;
+#[cfg(feature = "profile-vault")]
+pub mod entry;
 #[cfg(feature = "profile-vault")]
 pub mod envelope;
 pub mod error;
@@ -112,6 +116,8 @@ pub use memlock::LockedBuffer;
 ///             tlv
 ///             cipher
 ///             kdf
+///             entry
+///             credential
 ///             envelope
 ///             slots
 ///         }

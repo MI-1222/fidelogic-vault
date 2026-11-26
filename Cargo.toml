@@ -9,6 +9,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 
 [workspace.dependencies]
 fidelogic-core = { path = "crates/fidelogic-core", default-features = false }
