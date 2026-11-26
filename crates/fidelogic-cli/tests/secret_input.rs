@@ -6,7 +6,7 @@
 use std::error::Error;
 use std::fs::{self, File, Permissions};
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -255,8 +255,10 @@ fn verify_descriptors(watcher: &InterruptWatcher) -> TestResult {
         )
     };
     assert_eq!(opened, 0, "疑似端末の作成に失敗。");
+    // SAFETY: `openpty` が成功した直後の記述子で、所有者は他に無い。
+    let (_master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     assert_eq!(
-        read(slave),
+        read(slave.as_raw_fd()),
         Err(SecretInputError::Tty(TtyError::DescriptorIsTerminal))
     );
     Ok(())
